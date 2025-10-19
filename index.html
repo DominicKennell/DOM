@@ -1,316 +1,528 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
+<meta charset="utf-8" />
 <title>DOM</title>
 <style>
-body {
-    background: #1e1e1e;
-    color: #fff;
-    font-family: monospace;
-    padding: 10px;
-}
-#controls { margin-bottom: 10px; }
-button { padding: 5px 10px; margin-right: 5px; }
-#resources {
-    border: 1px solid #444;
-    padding: 5px;
-    margin-bottom: 10px;
-}
-.resource-bar {
-    position: relative;
-    background: #222;
-    border: 1px solid #444;
-    margin: 2px 0;
-     width: 200px;
-    height: 18px;
-}
-.resource-fill {
-    position: absolute;
-    height: 100%;
-    background: #66ff66;
-    width: 0%;
-}
-#simulation {
-     border: 1px solid #444;
-     padding: 10px;
-    max-height: 60vh;
-    overflow-y: scroll;
-}
-.agent {
-    margin-bottom: 2px;
-    padding: 2px 4px;
-    border-radius: 3px;
-    display: inline-block;
-}
+  html,body { height:100%; margin:0; background:#0f0f12; color:#eee; font-family:monospace; }
+  #ui { position:fixed; left:12px; top:12px; z-index:20; width:360px; }
+  #controls { margin-bottom:8px; display:flex; gap:6px; align-items:center; }
+  button,input { font:inherit; padding:6px; background:#222; color:#eee; border:1px solid #333; }
+  #resources { margin-top:8px; border:1px solid #222; padding:8px; background:rgba(0,0,0,0.35); }
+  .resource-bar { height:12px; background:#111; border:1px solid #222; margin:6px 0; width:320px; position:relative; }
+  .resource-fill { height:100%; width:0%; background:#66ff66; transition:width 0.25s linear; }
+  #hud { margin-top:8px; color:#ccc; font-size:13px; }
+  #canvasWrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; width:100%; height:100%; }
+  #legend { margin-top:6px; font-size:12px; color:#bbb; }
 </style>
 </head>
 <body>
-<h1>SIMULATION DOM</h1>
-<div id="controls">
-    <button id="startBtn">Start</button>
-    <button id="stopBtn">Stop</button>
-</div>
-<div id="resources"></div>
-<div id="simulation"></div>
+  <div id="ui">
+    <div id="controls">
+      <button id="startBtn">Start</button>
+      <button id="stopBtn">Stop</button>
+      <label style="color:#bbb">Step(ms):<input id="intervalInput" type="number" value="450" style="width:70px; margin-left:6px;"></label>
+    </div>
+    <div id="resources"></div>
+    <div id="hud">
+      <div id="popInfo">Population: 0</div>
+      <div id="genInfo">Generations (max visible hue): —</div>
+      <div id="legend">Dots: agents (color = melody trait; brightness/pulse = energy)</div>
+    </div>
+  </div>
+
+  <div id="canvasWrap"><canvas id="simCanvas"></canvas></div>
 
 <script>
-// --- Shared AudioContext & New Global State for Hearing ---
-const audioCtx = new (window.AudioContext||window.webkitAudioContext)();
-let recentSignals = []; // NEW: Logs all signals played in the current step
+// -------------------- Setup --------------------
+const canvas = document.getElementById('simCanvas');
+const ctx = canvas.getContext('2d', { alpha:true });
+function resize(){ canvas.width = innerWidth; canvas.height = innerHeight; }
+addEventListener('resize', resize);
+resize();
 
-// --- Neural Network (Input Size updated to 14) ---
+// Shared audio
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+let ambientGainNode = null;
+
+// util
+const rand = (a,b=0) => b===0 ? Math.random()*a : a + Math.random()*(b-a);
+const choice = arr => arr[Math.floor(Math.random()*arr.length)];
+const clamp = (x,a,b) => Math.max(a, Math.min(b, x));
+const now = ()=> audioCtx.currentTime;
+
+// -------------------- Globals --------------------
+let recentSignals = []; // hearing buffer for each step
+let stepInterval = 450;
+let stepTimer = null;
+let running = false;
+let stepCount = 0;
+
+// -------------------- Environment --------------------
+const environment = { food:500, energy:500, metal:300, water:400, fire:200, air:300, trees:350 };
+
+// -------------------- Neural Net (small) --------------------
 class NeuralNetwork {
-    // INPUT SIZE IS NOW 14
-    constructor(inputSize=14, hiddenSize=16, outputSize=5, lr=0.05){ 
-        this.inputSize=inputSize; this.hiddenSize=hiddenSize; this.outputSize=outputSize; this.lr=lr;
-        this.W1=Array.from({length:hiddenSize}, ()=>Array.from({length:inputSize}, ()=>Math.random()*0.2-0.1));
-        this.b1=Array(hiddenSize).fill(0);
-        this.W2=Array.from({length:outputSize}, ()=>Array.from({length:hiddenSize}, ()=>Math.random()*0.2-0.1));
-        this.b2=Array(outputSize).fill(0);
-    }
-    tanh(x){ return Math.tanh(x); }
-    dtanh(y){ return 1-y*y; }
-    softmax(arr){ const max=Math.max(...arr); const exps=arr.map(v=>Math.exp(v-max)); const sum=exps.reduce((a,b)=>a+b,0); return exps.map(v=>v/sum); }
-    forward(x){
-        this.x=x.slice();
-        this.z1=this.W1.map((row,i)=>row.reduce((sum,v,j)=>sum+v*x[j],0)+this.b1[i]);
-        this.a1=this.z1.map(v=>this.tanh(v));
-        this.z2=this.W2.map((row,i)=>row.reduce((sum,v,j)=>sum+v*this.a1[j],0)+this.b2[i]);
-        this.a2=this.softmax(this.z2);
-        return this.a2;
-    }
-    train(actionIdx,reward){
-        const dZ2=this.a2.slice(); dZ2[actionIdx]-=1; for(let i=0;i<dZ2.length;i++) dZ2[i]*=reward;
-        const dW2=this.W2.map((row,i)=>row.map((v,j)=>dZ2[i]*this.a1[j])); const db2=dZ2.slice();
-        const da1=Array(this.hiddenSize).fill(0);
-        for(let i=0;i<this.hiddenSize;i++) for(let j=0;j<this.outputSize;j++) da1[i]+=this.W2[j][i]*dZ2[j];
-        const dz1=da1.map((v,i)=>v*(1-this.a1[i]**2));
-        const dW1=this.W1.map((row,i)=>row.map((v,j)=>dz1[i]*this.x[j])); const db1=dz1.slice();
-        for(let i=0;i<this.W2.length;i++){ for(let j=0;j<this.W2[0].length;j++) this.W2[i][j]-=this.lr*dW2[i][j]; this.b2[i]-=this.lr*db2[i]; }
-        for(let i=0;i<this.W1.length;i++){ for(let j=0;j<this.W1[0].length;j++) this.W1[i][j]-=this.lr*dW1[i][j]; this.b1[i]-=this.lr*db1[i]; }
-    }
+  constructor(inputSize=16, hidden=20, out=5, lr=0.02){
+    this.inputSize = inputSize; this.hidden = hidden; this.out = out; this.lr = lr;
+    this.W1 = Array.from({length:hidden}, ()=>Array.from({length:inputSize}, ()=>rand(-0.1,0.1)));
+    this.b1 = Array(hidden).fill(0);
+    this.W2 = Array.from({length:out}, ()=>Array.from({length:hidden}, ()=>rand(-0.1,0.1)));
+    this.b2 = Array(out).fill(0);
+  }
+  tanh(x){ return Math.tanh(x); }
+  dtanh(y){ return 1-y*y; }
+  softmax(arr){ const m=Math.max(...arr); const exps=arr.map(v=>Math.exp(v-m)); const s=exps.reduce((a,b)=>a+b,0); return exps.map(v=>v/s); }
+  forward(x){
+    this.x = x.slice();
+    this.z1 = this.W1.map((row,i)=> row.reduce((s,v,j)=> s + v*x[j], 0) + this.b1[i]);
+    this.a1 = this.z1.map(v=>this.tanh(v));
+    this.z2 = this.W2.map((row,i)=> row.reduce((s,v,j)=> s + v*this.a1[j], 0) + this.b2[i]);
+    this.a2 = this.softmax(this.z2);
+    return this.a2;
+  }
+  train(idx, reward){
+    const dZ2 = this.a2.slice(); dZ2[idx] -= 1; for(let i=0;i<dZ2.length;i++) dZ2[i]*=reward;
+    const dW2 = this.W2.map((row,i)=> row.map((v,j)=> dZ2[i]*this.a1[j]));
+    const db2 = dZ2.slice();
+    const da1 = Array(this.hidden).fill(0);
+    for(let i=0;i<this.hidden;i++) for(let j=0;j<this.out;j++) da1[i] += this.W2[j][i]*dZ2[j];
+    const dz1 = da1.map((v,i)=> v*this.dtanh(this.a1[i]));
+    const dW1 = this.W1.map((row,i)=> row.map((v,j)=> dz1[i]*this.x[j]));
+    const db1 = dz1.slice();
+    // apply
+    for(let i=0;i<this.out;i++){ for(let j=0;j<this.hidden;j++) this.W2[i][j] -= this.lr * dW2[i][j]; this.b2[i] -= this.lr * db2[i]; }
+    for(let i=0;i<this.hidden;i++){ for(let j=0;j<this.inputSize;j++) this.W1[i][j] -= this.lr * dW1[i][j]; this.b1[i] -= this.lr * db1[i]; }
+  }
 }
 
-// --- Environment ---
-const environment = {
-    food: 500, energy: 500, metal: 300,
-    water: 400, fire: 200, air: 300, trees: 350
-};
-
-// --- Agent (Updated for Survival and Sensing) ---
-class Agent{
-    constructor(name,parent=null, generation=0){
-        // Survival adjustments
-        this.name=name; this.food=40; this.energy=40; this.metal=10; this.alive=true;
-        this.strength=Math.floor(Math.random()*10)+1; this.cooperation=Math.random();
-        this.lifetimeReward=0; this.children=[]; this.lastAction="None"; this.memory=[]; this.MAX_MEMORY=5; this.trust={};
-        this.generation=generation;
-        this.melodyTendency=parent ? Math.min(Math.max(parent.melodyTendency+(Math.random()-0.5)*0.2,0),1) : Math.random();
-        this.rhythmComplexity=parent ? Math.min(Math.max(parent.rhythmComplexity+(Math.random()-0.5)*0.2,0),1) : Math.random();
-        this.harmonyPreference=parent ? Math.min(Math.max(parent.harmonyPreference+(Math.random()-0.5)*0.2,0),1) : Math.random();
-        if(parent){
-            this.signalMap={};
-            for(let action in parent.signalMap){
-                this.signalMap[action]=parent.signalMap[action].map(f=>f+(Math.random()-0.5)*4);
-            }
-        } else {
-            this.signalMap={gather:[400,500],trade:[500,600],fight:[700,800],social:[300,400],reproduce:[600,700]};
-        }
-        this.nn=new NeuralNetwork();
-    }
-
-    getState(){
-        const avgReward=this.memory.length>0 ? this.memory.reduce((a,b)=>a+b[2],0)/this.memory.length :0;
-        const avgTrust=Object.keys(this.trust).length>0 ? Object.values(this.trust).reduce((a,b)=>a+b,0)/Object.keys(this.trust).length :0;
-
-        // --- NEW: Sensing Logic ---
-        let totalMelody = 0;
-        let totalRhythm = 0;
-        const relevantSignals = recentSignals.filter(s => s.action !== this.lastAction); // Ignore own signal
-        const numSignals = relevantSignals.length;
-
-        if (numSignals > 0) {
-            relevantSignals.forEach(s => {
-                totalMelody += s.melody;
-                totalRhythm += s.rhythm;
-            });
-        }
-        const avgHeardMelody = numSignals > 0 ? (totalMelody / numSignals) : 0;
-        const avgHeardRhythm = numSignals > 0 ? (totalRhythm / numSignals) : 0;
-        // ---------------------------
-
-        return [
-            this.food/50,this.energy/50,this.metal/30,
-            this.strength/10,this.cooperation,
-            this.melodyTendency,this.rhythmComplexity,this.harmonyPreference,
-            avgReward,avgTrust,this.memory.length/this.MAX_MEMORY,Math.random(),
-            // NEW: 13th and 14th Input for Hearing
-            avgHeardMelody,
-            avgHeardRhythm 
-        ];
-    }
-
-    chooseAction(){
-        const state=this.getState();
-        const probs=this.nn.forward(state);
-        let sum=0; const r=Math.random();
-        for(let i=0;i<probs.length;i++){ sum+=probs[i]; if(r<sum){ this.lastActionIdx=i; break; } }
-        const actions=["gather","trade","fight","social","reproduce"];
-        this.lastAction=actions[this.lastActionIdx]||"gather";
-        return this.lastAction;
-    }
-
-    act(agents){
-        if(!this.alive) return;
-        this.chooseAction(); let reward=0;
-        agents.forEach(a=>{this.trust[a.name]=this.trust[a.name]||0.5; a.trust[this.name]=a.trust[this.name]||0.5; });
-
-        switch(this.lastAction){
-            case "gather":
-                const resKeys=Object.keys(environment);
-                const res=resKeys[Math.floor(Math.random()*resKeys.length)];
-                const gathered=Math.min(environment[res],Math.floor(Math.random()*5)+1);
-                environment[res]-=gathered;
-                if(res==="food") this.food+=gathered;
-                else if(res==="energy") this.energy+=gathered;
-                else if(res==="metal") this.metal+=gathered;
-                reward+=gathered/2; 
-                break;
-            case "trade":
-                const partners=agents.filter(a=>a!==this && a.alive && this.trust[a.name]>0.3);
-                if(partners.length>0){
-                    const partner=partners[Math.floor(Math.random()*partners.length)];
-                    const tradeAmount=Math.min(this.metal,Math.floor(Math.random()*3)+1);
-                    if(tradeAmount>0){ this.metal-=tradeAmount; partner.food+=tradeAmount; reward+=tradeAmount/3; }
-                }
-                break;
-            case "fight":
-                const targets=agents.filter(a=>a!==this && a.alive);
-                if(targets.length>0){
-                    const target=targets[Math.floor(Math.random()*targets.length)];
-                    if(this.strength>target.strength){
-                        const stolen=Math.min(target.food,Math.floor(Math.random()*3)+1);
-                        target.food-=stolen; this.food+=stolen; reward+=stolen/3; this.trust[target.name]-=0.1;
-                    } else { reward-=0.2; this.trust[target.name]+=0.05; }
-                }
-                break;
-            case "social":
-                this.food-=1; reward-=0.1; agents.forEach(a=>{ if(a!==this) this.trust[a.name]+=0.01; });
-                break;
-            case "reproduce":
-                if(this.food>10 && this.energy>10){
-                    this.food-=10; this.energy-=10;
-                    const child=new Agent(this.name+"_child",this,this.generation+1);
-                    this.children.push(child);
-                    agents.push(child);
-                    reward+=0.5;
-                }
-                break;
-        }
-
-        reward+=0.5; this.food-=0.5; this.energy-=0.5;
-        if(this.food<=0 || this.energy<=0){ this.alive=false; reward-=2.0; }
-
-        this.lifetimeReward+=reward;
-        if(typeof this.lastActionIdx!=="undefined") this.nn.train(this.lastActionIdx,reward);
-        
-        // --- NEW: Broadcast Signal Data to Environment ---
-        if (this.alive) {
-            const signalData = {
-                action: this.lastAction,
-                melody: this.melodyTendency,
-                rhythm: this.rhythmComplexity
-            };
-            recentSignals.push(signalData);
-            setTimeout(()=>this.playSignal(), Math.random()*200);
-        }
-    }
-
-    playSignal(){
-        const freqs=this.signalMap[this.lastAction];
-        const osc=audioCtx.createOscillator();
-        const gain=audioCtx.createGain();
-        osc.type='sine';
-        osc.frequency.setValueAtTime(freqs[0]*(0.8+0.4*this.energy/50), audioCtx.currentTime);
-        gain.gain.value = 0.1 + 0.05*this.rhythmComplexity;
-        osc.connect(gain); gain.connect(audioCtx.destination);
-        osc.start(); osc.stop(audioCtx.currentTime + 0.2 + 0.2*this.rhythmComplexity);
-    }
+// -------------------- Musical helpers --------------------
+function mkMelody(base){
+  const len = Math.floor(rand(2,5));
+  const out = [];
+  for(let i=0;i<len;i++){
+    const shift = rand(-30,30) + (Math.random()<0.08 ? (Math.random()<0.5?-120:120) : 0);
+    out.push(Math.max(70, base + shift));
+  }
+  return out;
+}
+function melodySimilarity(m1,m2){
+  if(!m1 || !m2 || m1.length===0 || m2.length===0) return 0;
+  const L = Math.max(m1.length,m2.length);
+  let s=0;
+  for(let i=0;i<L;i++){
+    const a = m1[i % m1.length], b = m2[i % m2.length];
+    s += (a-b)*(a-b);
+  }
+  const mse = s / L;
+  return Math.exp(-mse / (120*120));
+}
+function playMelody(melody, noteDur=0.10, volume=0.07){
+  const start = audioCtx.currentTime + 0.01;
+  const master = audioCtx.createGain(); master.gain.setValueAtTime(volume, start); master.connect(audioCtx.destination);
+  melody.forEach((f,i)=>{
+    const t = start + i * noteDur;
+    const osc = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(f, t);
+    g.gain.setValueAtTime(0.0, t);
+    g.gain.linearRampToValueAtTime(volume, t + 0.01);
+    g.gain.linearRampToValueAtTime(0, t + noteDur - 0.01);
+    osc.connect(g); g.connect(master);
+    osc.start(t); osc.stop(t + noteDur);
+  });
 }
 
-// --- Simulation ---
-let agents=[new Agent("ALEX"),new Agent("JOE"),new Agent("SAM"),new Agent("JESSE"), new Agent("BLAKE")];
-let running=false, stepCount=0, intervalId=null;
-
-function flattenAgents(agentList){
-    let allAgents=[];
-    agentList.forEach(a=>{ allAgents.push(a); if(a.children.length>0) allAgents=allAgents.concat(flattenAgents(a.children)); });
-    return allAgents;
+// gentle ambient pad (if few agents alive)
+function startAmbient(){
+  if(ambientGainNode) return;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(80, audioCtx.currentTime);
+  g.gain.setValueAtTime(0.0, audioCtx.currentTime);
+  o.connect(g); g.connect(audioCtx.destination);
+  o.start();
+  ambientGainNode = { osc:o, gain:g };
+}
+function setAmbientLevel(level){ // 0..1
+  if(!ambientGainNode) startAmbient();
+  ambientGainNode.gain.gain.cancelScheduledValues(audioCtx.currentTime);
+  ambientGainNode.gain.gain.setTargetAtTime(level*0.04, audioCtx.currentTime, 0.2);
 }
 
+// -------------------- Agent (dots) --------------------
+class Agent {
+  constructor(name, parent=null, generation=0){
+    this.name = name;
+    this.food = 30; this.energy = 30; this.metal = 8;
+    this.alive = true;
+    this.strength = Math.floor(rand(1,10));
+    this.cooperation = Math.random();
+    this.lifetimeReward = 0;
+    this.children = [];
+    this.lastAction = "None";
+    this.memory = [];
+    this.MAX_MEMORY = 6;
+    this.trust = {};
+    this.generation = generation;
+    // spatial
+    if(parent){
+      // spawn near parent
+      const px = parent.x || rand(canvas.width*0.2, canvas.width*0.8);
+      const py = parent.y || rand(canvas.height*0.2, canvas.height*0.8);
+      this.x = clamp(px + rand(-40,40), 40, canvas.width-40);
+      this.y = clamp(py + rand(-40,40), 40, canvas.height-40);
+    } else {
+      this.x = rand(canvas.width*0.2, canvas.width*0.8);
+      this.y = rand(canvas.height*0.2, canvas.height*0.8);
+    }
+    this.vx = rand(-0.3,0.3); this.vy = rand(-0.3,0.3);
+
+    // musical traits
+    if(parent){
+      this.melodyTendency = clamp(parent.melodyTendency + rand(-0.12,0.12), 0,1);
+      this.rhythmComplexity = clamp(parent.rhythmComplexity + rand(-0.12,0.12), 0,1);
+      this.harmonyPreference = clamp(parent.harmonyPreference + rand(-0.12,0.12), 0,1);
+      // inherit and mutate phrases
+      this.signalMap = {};
+      for(const a in parent.signalMap){
+        let p = parent.signalMap[a].slice();
+        if(Math.random() < 0.15 && p.length>1) p.splice(Math.floor(rand(0,p.length)),1);
+        if(Math.random() < 0.22) p.splice(Math.floor(rand(0,p.length+1)),0, (p.reduce((s,v)=>s+v,0)/p.length) + rand(-30,30));
+        p = p.map(n => n + rand(-8,8));
+        this.signalMap[a] = p;
+      }
+    } else {
+      this.melodyTendency = Math.random();
+      this.rhythmComplexity = Math.random();
+      this.harmonyPreference = Math.random();
+      this.signalMap = {
+        gather: mkMelody(420),
+        trade: mkMelody(540),
+        fight: mkMelody(760),
+        social: mkMelody(360),
+        reproduce: mkMelody(660)
+      };
+    }
+    this.nn = new NeuralNetwork(16,20,5,0.02);
+    // color hue from melody tendency
+    this.hue = Math.floor(200 * this.melodyTendency) + 20; // 20..220
+  }
+
+  getState(){
+    const avgReward = this.memory.length>0 ? this.memory.reduce((s,m)=>s+m[2],0)/this.memory.length : 0;
+    const avgTrust = Object.keys(this.trust).length>0 ? Object.values(this.trust).reduce((a,b)=>a+b,0)/Object.keys(this.trust).length : 0;
+    // hearing: compute average pitch & similarity of recentSignals excluding self
+    const heard = recentSignals.filter(s => s.sender !== this.name);
+    let avgPitch = 0, varPitch = 0, avgSim = 0;
+    if(heard.length > 0){
+      const means = heard.map(h => h.melody.reduce((s,v)=>s+v,0)/h.melody.length);
+      const meanAll = means.reduce((s,v)=>s+v,0)/means.length;
+      avgPitch = meanAll / 1000;
+      varPitch = means.reduce((s,v)=>s + (v-meanAll)*(v-meanAll), 0) / (means.length * (1000*1000));
+      const own = this.signalMap[this.lastAction] || [];
+      avgSim = heard.reduce((s,h)=> s + melodySimilarity(own, h.melody), 0) / heard.length;
+    }
+    return [
+      this.food/90, this.energy/90, this.metal/50,
+      this.strength/12, this.cooperation,
+      this.melodyTendency, this.rhythmComplexity, this.harmonyPreference,
+      avgReward, avgTrust, this.memory.length/this.MAX_MEMORY, Math.random(),
+      avgPitch, varPitch, avgSim, (this.generation/12)
+    ];
+  }
+
+  chooseAction(){
+    const state = this.getState();
+    const probs = this.nn.forward(state);
+    let r = Math.random(), s=0, idx=0;
+    for(let i=0;i<probs.length;i++){ s+=probs[i]; if(r < s){ idx = i; break; } }
+    const acts = ["gather","trade","fight","social","reproduce"];
+    this.lastActionIdx = idx;
+    this.lastAction = acts[idx];
+    return this.lastAction;
+  }
+
+  act(allAgents){
+    if(!this.alive) return;
+    this.chooseAction();
+    let reward = 0;
+    allAgents.forEach(a => { this.trust[a.name] = this.trust[a.name] ?? 0.5; a.trust[this.name] = a.trust[this.name] ?? 0.5; });
+
+    switch(this.lastAction){
+      case "gather": {
+        // choose scarcest resource to encourage variety
+        const keys = Object.keys(environment);
+        keys.sort((a,b)=> (environment[a] - environment[b]));
+        const res = keys[0];
+        const amount = Math.min(Math.floor(rand(1,5)), Math.floor(environment[res]));
+        environment[res] = Math.max(0, environment[res] - amount);
+        if(res==="food") this.food += amount;
+        else if(res==="energy") this.energy += amount;
+        else if(res==="water") this.food += Math.floor(amount*0.35);
+        else if(res==="trees") this.metal += Math.floor(amount*0.25);
+        else if(res==="metal") this.metal += amount;
+        reward += amount/4;
+      } break;
+      case "trade": {
+        const partners = allAgents.filter(a => a!==this && a.alive && this.trust[a.name] > 0.4);
+        if(partners.length>0){
+          const p = choice(partners);
+          const give = Math.min(this.metal, Math.floor(rand(1,3)));
+          if(give > 0){ this.metal -= give; p.food += give; reward += give/3; this.trust[p.name]+=0.05; p.trust[this.name]+=0.03; }
+        }
+      } break;
+      case "fight": {
+        const targets = allAgents.filter(a => a!==this && a.alive);
+        if(targets.length>0){
+          const t = choice(targets);
+          if(this.strength > t.strength){
+            const stolen = Math.min(t.food, Math.floor(rand(1,3)));
+            t.food -= stolen; this.food += stolen; reward += stolen/3; this.trust[t.name] -= 0.12;
+          } else { reward -= 0.3; this.trust[t.name] += 0.02; }
+        }
+      } break;
+      case "social": {
+        this.food -= 1; reward -= 0.05;
+        allAgents.forEach(a => { if(a!==this) this.trust[a.name] = clamp(this.trust[a.name]+0.015, 0,1); });
+      } break;
+      case "reproduce": {
+        if(this.food > 14 && this.energy > 12){
+          this.food -= 12; this.energy -= 12;
+          const child = new Agent(this.name + "_child", this, this.generation + 1);
+          this.children.push(child); allAgents.push(child);
+          reward += 1.5;
+        }
+      } break;
+    }
+
+    // survival costs & training
+    reward += 0.08;
+    this.food -= 0.6; this.energy -= 0.6;
+    if(this.food <= 0 || this.energy <= 0){ this.alive = false; reward -= 1.8; }
+
+    if(typeof this.lastActionIdx !== "undefined"){
+      this.nn.train(this.lastActionIdx, reward);
+      this.memory.push([this.getState(), this.lastActionIdx, reward]);
+      if(this.memory.length > this.MAX_MEMORY) this.memory.shift();
+    }
+    this.lifetimeReward += reward;
+
+    // broadcast signal for others to hear
+    if(this.alive){
+      const sig = { sender:this.name, action:this.lastAction, melody:this.signalMap[this.lastAction].slice(), rhythm:this.rhythmComplexity };
+      recentSignals.push(sig);
+      // schedule audio
+      setTimeout(()=> this.playPhrase(sig.melody, sig.rhythm), rand(0,180));
+    }
+
+    // call-and-response
+    const heardSocial = recentSignals.filter(s => s.action === "social" || s.action === "trade");
+    if(heardSocial.length > 0 && Math.random() < 0.12 * this.cooperation){
+      const base = this.signalMap["social"].slice();
+      const reply = base.map(n => n + rand(-8,8));
+      setTimeout(()=> playMelody(reply, 0.085, 0.055), rand(80,220));
+      heardSocial.forEach(h => { this.trust[h.sender] = clamp((this.trust[h.sender]||0.5)+0.02, 0,1); });
+    }
+
+    // small mutation after reproduction
+    if(this.lastAction === "reproduce" && Math.random() < 0.07){
+      const list = this.signalMap["reproduce"];
+      if(Math.random() < 0.5) list.push(list[list.length-1] + rand(-18,18));
+      else if(list.length > 2 && Math.random() < 0.3) list.splice(Math.floor(rand(0,list.length)),1);
+    }
+  }
+
+  playPhrase(melody, rhythm){
+    const vol = clamp(0.04 + 0.06 * (this.energy/40) * (0.4 + 0.6 * this.harmonyPreference), 0.02, 0.16);
+    playMelody(melody, 0.10 + 0.06 * (1 - this.rhythmComplexity), vol);
+  }
+
+  // small drift for visual movement
+  stepVisual(dt=1){
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+    // keep within bounds
+    if(this.x < 30){ this.x=30; this.vx *= -1; }
+    if(this.x > canvas.width-30){ this.x = canvas.width-30; this.vx *= -1; }
+    if(this.y < 30){ this.y=30; this.vy *= -1; }
+    if(this.y > canvas.height-30){ this.y = canvas.height-30; this.vy *= -1; }
+  }
+}
+
+// -------------------- Simulation init --------------------
+let agents = [ new Agent("ALEX"), new Agent("JOE"), new Agent("SAM"), new Agent("JESSE"), new Agent("BLAKE") ];
+
+// flatten helper
+function flatten(list){
+  const out = [];
+  list.forEach(a => { out.push(a); if(a.children && a.children.length) out.push(...flatten(a.children)); });
+  return out;
+}
+
+// -------------------- Simulation step --------------------
 function simulateStep(){
-    // NEW: Clear signals from the previous step so agents can hear new ones
-    recentSignals = []; 
-    
-    const allAgents=flattenAgents(agents);
-    const aliveAgents=allAgents.filter(a=>a.alive);
-    
-    aliveAgents.forEach(agent=>agent.act(allAgents));
+  // clear hearing buffer for this step (agents will push their signals)
+  recentSignals = [];
+  const all = flatten(agents);
+  const alive = all.filter(a=>a.alive);
 
-    if(stepCount%5===0){
-        environment.food=Math.min(environment.food+100,1000);
-        environment.energy=Math.min(environment.energy+60,1000);
-        environment.metal=Math.min(environment.metal+40,1000);
-        environment.air=Math.min(environment.air+40, 1000)
-        environment.trees=Math.min(environment.trees+100, 1000)
-        environment.water=Math.min(environment.water+100, 1000)
-        environment.fire=Math.min(environment.fire+40, 1000)
-    }
+  if(alive.length === 0){
+    // repopulate small brood derived from last lexicon if none alive
+    console.warn("All agents died — repopulating a small brood...");
+    const seed = agents.slice(0, Math.min(4, agents.length));
+    agents = seed.map((s,i) => new Agent("repop"+i, seed[i%seed.length], 0));
+  }
 
-    displayResources();
-    displayLineage(agents);
-    stepCount++;
+  alive.forEach(a => a.act(flatten(agents))); // pass full set so children appended correctly
+
+  // environment regen & mild decay
+  if(stepCount % 5 === 0){
+    environment.food = Math.min(environment.food + 80, 1000);
+    environment.energy = Math.min(environment.energy + 50, 1000);
+    environment.metal = Math.min(environment.metal + 30, 1000);
+    environment.air = Math.min(environment.air + 40, 1000);
+    environment.trees = Math.min(environment.trees + 80, 1000);
+    environment.water = Math.min(environment.water + 80, 1000);
+    environment.fire = Math.min(environment.fire + 40, 1000);
+  }
+  if(Math.random() < 0.12){
+    environment.food = Math.max(0, environment.food - rand(0,6));
+    environment.water = Math.max(0, environment.water - rand(0,4));
+  }
+
+  // ambient control: if few alive, raise ambient pad; if many alive, lower
+  const aliveCount = alive.length;
+  const ambientLevel = clamp(1 - (aliveCount/10), 0, 1); // more alive -> less ambient
+  setAmbientLevel(ambientLevel);
+
+  stepCount++;
 }
 
-// --- Resource bars ---
-function displayResources(){
-    const container=document.getElementById("resources");
-    container.innerHTML='';
-    for(const r in environment){
-        const bar=document.createElement('div'); bar.className='resource-bar';
-        const fill=document.createElement('div'); fill.className='resource-fill';
-        fill.style.width=Math.min(environment[r],1000)/10+'%';
-        bar.textContent=`${r}: ${Math.floor(environment[r])}`;
-        bar.appendChild(fill);
-        container.appendChild(bar);
-    }
-}
+// -------------------- Drawing --------------------
+function draw(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
 
-// --- Lineage display ---
-const colors=["#FFFFFF","#66CCFF","#99FF66","#FFCC66","#FF6666"];
-function displayLineage(agentList, container=document.getElementById("simulation"), depth=0){
-    container.innerHTML='';
-    function recurse(agent, depth){
-        const div=document.createElement('div'); div.className='agent';
-        const color=colors[Math.min(agent.generation,colors.length-1)];
-        div.style.color=color;
-        div.style.marginLeft=(depth*20)+'px';
-        div.textContent=`${agent.name} (Gen ${agent.generation}): ${agent.alive?"ALIVE":"DEAD"} | F:${agent.food} E:${agent.energy} | Last:${agent.lastAction} | R:${agent.lifetimeReward.toFixed(1)}`;
-        container.appendChild(div);
-        agent.children.forEach(child=>recurse(child, depth+1));
-    }
-    agentList.forEach(a=>recurse(a, depth));
-}
+  // draw subtle background grid
+  ctx.fillStyle = "#071017";
+  ctx.fillRect(0,0,canvas.width,canvas.height);
 
-// --- Controls ---
-document.getElementById("startBtn").onclick=()=>{ 
-    if(!running){ 
-        running=true; 
-        intervalId=setInterval(simulateStep,100); 
-    } 
+  // draw agents as dots with pulsing halo
+  const all = flatten(agents);
+  const timeNow = performance.now();
+
+  all.forEach((a)=>{
+    // visual step
+    a.stepVisual(1);
+
+    // halo pulse by energy & whether they produced a signal this step
+    const energyRatio = clamp(a.energy,0,60)/60;
+    const pulse = 0.3 + 0.6 * Math.abs(Math.sin((timeNow/430) + (a.generation*0.6)));
+    const haloRadius = 8 + 28 * energyRatio * pulse;
+    const hue = a.hue; // color hue
+    const alpha = (a.alive ? (0.12 + 0.6 * energyRatio * pulse) : 0.06);
+
+    ctx.beginPath();
+    ctx.fillStyle = `hsla(${hue},70%,60%,${alpha})`;
+    ctx.arc(a.x, a.y, haloRadius, 0, Math.PI*2);
+    ctx.fill();
+
+    // central dot
+    const dotRadius = a.alive ? (4 + 6 * energyRatio) : 3;
+    ctx.beginPath();
+    const sat = a.alive ? 70 : 12;
+    const light = a.alive ? 50 : 28;
+    ctx.fillStyle = `hsl(${hue}, ${sat}%, ${light}%)`;
+    ctx.arc(a.x, a.y, dotRadius, 0, Math.PI*2);
+    ctx.fill();
+
+    // small ring when they emitted recently (search recentSignals)
+    const emitted = recentSignals.find(s => s.sender === a.name);
+    if(emitted){
+      ctx.beginPath();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = `rgba(255,255,255,0.12)`;
+      ctx.arc(a.x, a.y, haloRadius + 6, 0, Math.PI*2);
+      ctx.stroke();
+    }
+  });
+
+  // HUD: population & generation stats
+  const aliveCount = all.filter(a=>a.alive).length;
+  document.getElementById('popInfo').textContent = `Population: ${aliveCount} (Total nodes: ${all.length})`;
+  // find max generation to inform legend
+  const maxGen = Math.max(...all.map(a=>a.generation));
+  document.getElementById('genInfo').textContent = `Max generation: ${maxGen}`;
+
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+
+// -------------------- UI resource display --------------------
+function updateResourceUI(){
+  const container = document.getElementById('resources');
+  container.innerHTML = '<strong>Resources</strong>';
+  for(const k of Object.keys(environment)){
+    const bar = document.createElement('div'); bar.className = 'resource-bar';
+    const fill = document.createElement('div'); fill.className = 'resource-fill';
+    const pct = Math.floor(clamp(environment[k],0,1000)/1000*100);
+    fill.style.width = pct + '%';
+    // color by resource
+    if(k==='food') fill.style.background='#66ff66';
+    else if(k==='water') fill.style.background='#66ccff';
+    else if(k==='energy') fill.style.background='#ffd166';
+    else if(k==='metal') fill.style.background='#cccccc';
+    else if(k==='trees') fill.style.background='#99ff99';
+    else if(k==='fire') fill.style.background='#ff9966';
+    else fill.style.background='#88aaff';
+    bar.textContent = `${k}: ${Math.floor(environment[k])}`;
+    bar.appendChild(fill);
+    container.appendChild(bar);
+  }
+  requestAnimationFrame(updateResourceUI);
+}
+requestAnimationFrame(updateResourceUI);
+
+// -------------------- Loop control --------------------
+document.getElementById('startBtn').addEventListener('click', ()=>{
+  if(running) return;
+  // resume audio context if not running (user gesture)
+  if(audioCtx.state === 'suspended') audioCtx.resume();
+  running = true;
+  stepInterval = Math.max(50, parseInt(document.getElementById('intervalInput').value) || 450);
+  stepTimer = setInterval(simulateStep, stepInterval);
+});
+document.getElementById('stopBtn').addEventListener('click', ()=>{
+  running = false;
+  if(stepTimer) clearInterval(stepTimer);
+  setAmbientLevel(0.08);
+});
+document.getElementById('intervalInput').addEventListener('change', (e)=>{
+  const v = Math.max(50, parseInt(e.target.value) || 450);
+  if(running){
+    clearInterval(stepTimer);
+    stepTimer = setInterval(simulateStep, v);
+  }
+});
+
+// -------------------- Helper to inspect lexicon in console --------------------
+window.dumpLexicon = function(){
+  const all = flatten(agents);
+  const map = {};
+  all.forEach(a=>{
+    for(const k in a.signalMap){
+      map[k] = map[k] || [];
+      map[k].push(a.signalMap[k].slice(0,6));
+    }
+  });
+  console.log("Lexicon sample:", map);
 };
-document.getElementById("stopBtn").onclick=()=>{ running=false; clearInterval(intervalId); };
+
+// Start ambient quietly
+startAmbient(); setAmbientLevel(0.08);
 </script>
 </body>
 </html>
