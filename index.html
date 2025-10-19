@@ -1,0 +1,989 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Interactive Simulation — Reinforcement AI Expansion</title>
+<style>
+    html,body{height:100%;margin:0;background:#000;color:#fff;font-family:Arial,Helvetica,sans-serif;overflow:hidden}
+    canvas{display:block}
+    #info{position:absolute;top:10px;left:10px;color:#fff;white-space:pre-line;font-family:Arial;z-index:10;max-width:36vw;max-height:80vh;overflow:auto;padding:8px;background:rgba(0,0,0,0.25);border-radius:8px; line-height: 1.4;}
+    #controls{position:absolute;top:10px;right:10px;z-index:10}
+    button{padding:6px 10px;font-size:14px;cursor:pointer;border-radius:6px; background-color: #333; color: #fff; border: 1px solid #555;}
+    button:hover { background-color: #555; }
+    .zoom-link{color:#0ff;text-decoration:underline;cursor:pointer;margin-left:5px}
+    .zoom-list{list-style-type:none;padding-left:10px;margin:5px 0}
+    .small{font-size:12px;color:#ccc}
+</style>
+</head>
+<body>
+<div id="info"></div>
+<div id="controls"><button id="backButton" style="display:none">← Zoom Out</button></div>
+<canvas id="universe"></canvas>
+<script>
+// =====================
+// Interactive Galaxy + Reinforcement Learning
+// =====================
+
+/* -------------------------
+   Canvas & resize handling
+   ------------------------- */
+const canvas = document.getElementById('universe');
+const ctx = canvas.getContext('2d');
+const infoDiv = document.getElementById('info');
+const backButton = document.getElementById('backButton');
+let DPR = window.devicePixelRatio || 1;
+function resize(){
+    DPR = window.devicePixelRatio || 1;
+    canvas.width = Math.floor(window.innerWidth * DPR);
+    canvas.height = Math.floor(window.innerHeight * DPR);
+    canvas.style.width = window.innerWidth + 'px';
+    canvas.style.height = window.innerHeight + 'px';
+    centerX = canvas.width/2;
+    centerY = canvas.height/2;
+    // reset any transforms
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.scale(DPR, DPR);
+}
+window.addEventListener('resize', ()=>{ resize(); });
+let centerX, centerY; resize();
+
+/* -------------------------
+   Simulation constants
+   ------------------------- */
+const G = 1;
+const sunMass = 10000;
+const blackHoleMass = 20000;
+const dt = 0.1;
+const expansionRate = 0.0005;
+const depth = 1500;
+const explosionSpeed = 150;
+let currentScale = 500;
+let focusEntity = null;
+let targetScale = 500;
+let targetPosition = {x:0,y:0,z:0};
+let zoomSpeed = 0.08;
+
+/* -------------------------
+   Helper functions
+   ------------------------- */
+function rand(a=-1,b=1){ return a + Math.random()*(b-a); }
+function randn(mean=0,std=1){ let u=0,v=0; while(u===0) u=Math.random(); while(v===0) v=Math.random(); return mean + std * Math.sqrt(-2*Math.log(u)) * Math.cos(2*Math.PI*v); }
+function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
+function fibonacci(n){ let f=[0,1]; for(let i=2;i<n;i++) f.push(f[i-1]+f[i-2]); return f.slice(1); }
+function project3D(x,y,z){ const effZ = Math.max(z + depth, 1); const s = currentScale / effZ; return { x: centerX + (x - targetPosition.x) * s, y: centerY + (y - targetPosition.y) * s, sizeScale: s }; }
+function traverseEntities(arr, cb){ arr.forEach(e=>{ cb(e); if(e.children) traverseEntities(e.children, cb); }); }
+
+/* -------------------------
+   Neural nets: policy + value (simple MLP with backprop)
+   ------------------------- */
+/* Network representation:
+   net = { layers: [in, hidden..., out],
+           weights: [Float32Array(rows*cols), ...], // row-major per-out neuron
+           biases: [Float32Array(rows), ...] }
+   We will implement forward that returns activations per layer for backprop.
+*/
+
+function createMLP(layers, initStd=0.5){
+    const net = { layers: layers.slice(), weights: [], biases: [] };
+    for(let i=0;i<layers.length-1;i++){
+        const rows = layers[i+1], cols = layers[i];
+        const w = new Float32Array(rows * cols);
+        for(let k=0;k<w.length;k++) w[k] = randn(0, initStd);
+        net.weights.push(w);
+        const b = new Float32Array(rows);
+        for(let k=0;k<rows;k++) b[k] = 0;
+        net.biases.push(b);
+    }
+    return net;
+}
+
+function forwardMLP(net, input){ // returns object {acts: [a0, a1, ...], pre: [z1,z2...]} where a0=input
+    let a = Float32Array.from(input);
+    const acts = [a];
+    const pres = [];
+    for(let l=0;l<net.weights.length;l++){
+        const rows = net.layers[l+1], cols = net.layers[l];
+        const w = net.weights[l], b = net.biases[l];
+        const z = new Float32Array(rows);
+        for(let r=0;r<rows;r++){
+            let s = b[r];
+            const off = r*cols;
+            for(let c=0;c<cols;c++) s += w[off + c] * a[c];
+            z[r] = s;
+        }
+        // activation: hidden layers tanh, final will be handled by caller
+        a = Float32Array.from(z);
+        if(l < net.weights.length - 1){
+            for(let i=0;i<a.length;i++) a[i] = Math.tanh(a[i]);
+        }
+        acts.push(a);
+        pres.push(z);
+    }
+    return { acts, pres };
+}
+
+// Softmax helper (numerically stable)
+function softmax(arr){
+    let maxv = -Infinity;
+    for(let i=0;i<arr.length;i++) if(arr[i] > maxv) maxv = arr[i];
+    const exps = new Float32Array(arr.length);
+    let sum = 0;
+    for(let i=0;i<arr.length;i++){ exps[i] = Math.exp(arr[i] - maxv); sum += exps[i]; }
+    for(let i=0;i<exps.length;i++) exps[i] /= sum;
+    return exps;
+}
+
+/* Backprop for policy MLP with action chosen (REINFORCE):
+   - We compute gradient of log π(a|s) * advantage and apply gradient descent.
+
+   We'll implement a simple backprop that computes gradients for weights & biases.
+   The final layer activation for policy we treat as raw logits then softmax -> prob.
+   For value net, final layer is linear -> scalar target.
+*/
+
+// allocate gradient structures (same shape as net)
+function zeroLikeNet(net){
+    return { weights: net.weights.map(w => new Float32Array(w.length)), biases: net.biases.map(b => new Float32Array(b.length)) };
+}
+
+// apply gradients: net = net - lr * grads (in-place)
+function applyGradients(net, grads, lr){
+    for(let i=0;i<net.weights.length;i++){
+        const W = net.weights[i], gW = grads.weights[i];
+        for(let k=0;k<W.length;k++) W[k] -= lr * gW[k];
+        const B = net.biases[i], gB = grads.biases[i];
+        for(let k=0;k<B.length;k++) B[k] -= lr * gB[k];
+    }
+}
+
+// compute gradients for policy given one (s,a,adv) tuple using stored forward pass
+function policyGradientsFromExample(net, forward, actionIndex, advantage){
+    // forward.acts: [a0(input), a1(hidden1), ..., aL(output pre-activated??)] where last acts are raw z used for softmax (we didn't tanh final)
+    // But in forwardMLP we did not tanh final; acts includes final pre-activations as a Float32Array
+    const L = net.weights.length;
+    const grads = zeroLikeNet(net);
+
+    // compute output softmax and its gradient for log-prob
+    const logits = forward.acts[forward.acts.length - 1]; // raw logits
+    const probs = softmax(logits);
+    // gradient of loss = -adv * d log pi(a)/d logits = -adv * (one_hot - probs)
+    // but REINFORCE uses grad = -adv * d log pi(a) ; for gradient descent we minimize -adv * logpi -> grad = -adv * d logpi
+    // We'll compute gradient of loss = -adv * logpi(a) so grads add (-adv * (one_hot - probs)) at output pre-activation
+    const dOut = new Float32Array(logits.length);
+    for(let i=0;i<dOut.length;i++){
+        const one = (i === actionIndex) ? 1 : 0;
+        dOut[i] = -advantage * (one - probs[i]); // negative because we minimize loss = -adv * logpi
+    }
+
+    // backprop through layers (we used tanh activations except final)
+    let delta = dOut; // shape rows of last layer
+    for(let l = L-1; l >= 0; l--){
+        const rows = net.layers[l+1], cols = net.layers[l];
+        const aPrev = forward.acts[l]; // activations of prev layer
+        // compute grads for weights: for each row r and col c: grad = delta[r] * aPrev[c]
+        const gW = grads.weights[l];
+        for(let r=0;r<rows;r++){
+            const off = r*cols;
+            const dr = delta[r];
+            for(let c=0;c<cols;c++){
+                gW[off + c] += dr * aPrev[c];
+            }
+            grads.biases[l][r] += dr;
+        }
+        if(l > 0){
+            // propagate delta to previous layer: deltaPrev = (W^T * delta) * tanh'(z)
+            const prevDelta = new Float32Array(cols);
+            const W = net.weights[l];
+            for(let r=0;r<rows;r++){
+                const off = r*cols;
+                const dr = delta[r];
+                for(let c=0;c<cols;c++){
+                    prevDelta[c] += W[off + c] * dr;
+                }
+            }
+            // apply tanh' at layer l (since hidden layer outputs were tanh)
+            const preZ = forward.pres[l-1]; // z for layer l (index offset)
+            for(let i=0;i<cols;i++){
+                // tanh'(z) = 1 - tanh(z)^2 ; note forward.acts[l] is tanh(preZ) when l-1 layer; careful with indices:
+                // forward.acts[l] is activation after applying tanh for layer l (if not final), but here we need derivative for layer l's activation w.r.t preZ of that layer
+                // For prevDelta corresponding to previous layer (index l-1)
+                const activated = forward.acts[l][i]; // WAIT careful: indexing mapping
+                // Simpler: we can use preZ from forward.pres[l-1], and compute tanh'(preZ)
+                const zval = preZ ? preZ[i] : 0;
+                // compute tanh derivative using activated value:
+                const act = Math.tanh(zval);
+                const d = 1 - act*act;
+                prevDelta[i] *= d;
+            }
+            delta = prevDelta;
+        }
+    }
+    return grads;
+}
+
+// compute gradients for value network (MSE loss) given forward and target return
+function valueGradientsFromExample(net, forward, target){
+    const L = net.weights.length;
+    const grads = zeroLikeNet(net);
+    // forward.acts last is scalar array [v]
+    const v = forward.acts[forward.acts.length - 1][0];
+    const dLoss_dv = 2 * (v - target); // d (v - target)^2 / dv
+    // Backprop scalar through layers (last layer linear)
+    let delta = new Float32Array([dLoss_dv]); // shape rows_last
+    for(let l = L-1; l >= 0; l--){
+        const rows = net.layers[l+1], cols = net.layers[l];
+        const aPrev = forward.acts[l];
+        const gW = grads.weights[l];
+        for(let r=0;r<rows;r++){
+            const off = r*cols;
+            const dr = delta[r];
+            for(let c=0;c<cols;c++){
+                gW[off + c] += dr * aPrev[c];
+            }
+            grads.biases[l][r] += dr;
+        }
+        if(l > 0){
+            const prevDelta = new Float32Array(cols);
+            const W = net.weights[l];
+            for(let r=0;r<rows;r++){
+                const off = r*cols;
+                const dr = delta[r];
+                for(let c=0;c<cols;c++){
+                    prevDelta[c] += W[off + c] * dr;
+                }
+            }
+            const preZ = forward.pres[l-1];
+            for(let i=0;i<cols;i++){
+                const zval = preZ ? preZ[i] : 0;
+                const act = Math.tanh(zval);
+                const d = 1 - act*act;
+                prevDelta[i] *= d;
+            }
+            delta = prevDelta;
+        }
+    }
+    return grads;
+}
+
+/* -------------------------
+   RL Hyperparameters & Helpers
+   ------------------------- */
+const OBS_SIZE = 7; // same observation as before
+const ACTION_COUNT = 5; // Build, Trade, Invest, Conserve, Attack
+const POLICY_HIDDEN = [16];
+const VALUE_HIDDEN = [8];
+const POLICY_LR = 0.0008;
+const VALUE_LR = 0.001;
+const GAMMA = 0.99;
+const EPISODE_STEPS = Math.round(20 / dt); // 20 seconds per episode
+const MAX_TRAJ_PER_PLANET = EPISODE_STEPS + 10;
+
+/* small utilities for trajectories */
+function discountRewards(rewards, gamma){
+    const out = new Float32Array(rewards.length);
+    let r = 0;
+    for(let i=rewards.length-1;i>=0;i--){
+        r = rewards[i] + gamma * r;
+        out[i] = r;
+    }
+    return out;
+}
+
+/* -------------------------
+   Create life & planets & attach brains
+   ------------------------- */
+function createAdvancedLife(size) {
+    const life = { maxPopulation: size * 1e8 * (Math.random()*0.5 + 1) };
+    if(Math.random()<0.8){
+        life.intelligent = {
+            population: Math.floor(Math.random()*1000+100),
+            baseGrowthRate: Math.random()*0.005+0.002,
+            growthRate:0, stage:1, currentAction:'Growth'
+        };
+        life.animals = { population: Math.floor(Math.random()*5000), growthRate: Math.random()*0.008+0.002, max: life.maxPopulation/10 };
+        life.plants = { population: Math.floor(Math.random()*10000), growthRate: Math.random()*0.01+0.002, max: life.maxPopulation };
+    }
+    if (life.intelligent) {
+        life.resources = { metal: Math.floor(Math.random()*500 + 100), food: Math.floor(Math.random()*800 + 200), energy: Math.floor(Math.random()*300 + 50) };
+        life.military = { ships: Math.floor(Math.random()*5), defense: Math.floor(Math.random()*10) + 5 };
+        life.diplomacy = {};
+    }
+    return Object.keys(life).length>0 ? life : null;
+}
+
+/* Build observation vector same as earlier */
+function buildObservation(planet){
+    const life = planet.life || {};
+    const intel = life.intelligent || { population:0, stage:1 };
+    const maxPop = life.maxPopulation || 1e8;
+    const popRatio = Math.min(1, intel.population / Math.max(1, maxPop));
+    const popScaled = popRatio*2 - 1;
+    const food = (life.resources && life.resources.food) || 0;
+    const metal = (life.resources && life.resources.metal) || 0;
+    const energy = (life.resources && life.resources.energy) || 0;
+    const foodScaled = Math.tanh(food / 1000);
+    const metalScaled = Math.tanh(metal / 1000);
+    const energyScaled = Math.tanh(energy / 1000);
+    const ships = (life.military && life.military.ships) || 0;
+    const shipsScaled = Math.tanh(ships / 20);
+    const stageScaled = (intel.stage - 2) / 1;
+    let dipScore = 0, dipCount = 0;
+    if(life.diplomacy){
+        for(const k in life.diplomacy){
+            const r = life.diplomacy[k];
+            dipCount++;
+            if(r === 'War') dipScore -= 1;
+            else if(r === 'Trade') dipScore += 1;
+        }
+    }
+    const dipAvg = dipCount ? (dipScore / dipCount) : 0;
+    return [popScaled, foodScaled, metalScaled, energyScaled, shipsScaled, stageScaled, dipAvg];
+}
+
+/* -------------------------
+   Policy + Value creation & per-planet memory
+   ------------------------- */
+function attachRLToPlanet(planet){
+    // create policy MLP and value MLP
+    planet.policy = createMLP([OBS_SIZE, ...POLICY_HIDDEN, ACTION_COUNT], 0.4);
+    planet.valueNet = createMLP([OBS_SIZE, ...VALUE_HIDDEN, 1], 0.4);
+    planet.memory = { obs:[], acts:[], rewards:[], forwardPolicy:[], forwardValue:[] };
+    planet.trainSteps = 0;
+}
+
+/* -------------------------
+   Create star systems / universe
+   ------------------------- */
+function createStarSystem(parentPos, size, idBase){
+    const star = { id:idBase, size:size, type:'Star', position:{...parentPos}, velocity:{x:0,y:0,z:0}, life:null, children:[], mass:size*100 };
+    const numPlanets = Math.floor(Math.random()*4) + 1;
+    for(let j=0;j<numPlanets;j++){
+        const planetSize = Math.floor(Math.random()*3)+1;
+        const planetDist = (j+1)*20 + Math.random()*6 - 3;
+        const planetAngle = Math.random()*Math.PI*2;
+        const planetZ = Math.random()*10 - 5;
+        const pX = star.position.x + planetDist*Math.cos(planetAngle);
+        const pY = star.position.y + planetDist*Math.sin(planetAngle);
+        const pZ = star.position.z + planetZ;
+        const orbitalSpeed = Math.sqrt(Math.max(G * star.mass / Math.max(planetDist,1), 0));
+        const vX = -orbitalSpeed * Math.sin(planetAngle);
+        const vY = orbitalSpeed * Math.cos(planetAngle);
+        const planet = {
+            id:`${idBase}.${j+1}`,
+            size:planetSize, type:'Planet',
+            position:{x:pX,y:pY,z:pZ},
+            velocity:{x:star.velocity.x+vX,y:star.velocity.y+vY,z:star.velocity.z},
+            life:createAdvancedLife(planetSize),
+            parent:star, mass:planetSize*10
+        };
+        // attach RL brains if intelligent
+        if(planet.life && planet.life.intelligent) attachRLToPlanet(planet);
+        star.children.push(planet);
+    }
+    return star;
+}
+
+function createUniverse(numGalaxies){
+    const universe = [];
+    const fibNumbers = fibonacci(numGalaxies);
+    for(let i=0;i<fibNumbers.length;i++){
+        const size = fibNumbers[i];
+        const distance = size*30 + 100 + Math.random()*40 - 20;
+        const angle = Math.random()*Math.PI*2;
+        const z = Math.random()*200 - 100;
+        const posX = distance*Math.cos(angle), posY = distance*Math.sin(angle), posZ = z;
+        const r = Math.sqrt(posX*posX + posY*posY + posZ*posZ);
+        const vScale = r>0 ? explosionSpeed / r : 0;
+        const galaxy = { id:i+1, size:size, type:'Galaxy', position:{x:posX,y:posY,z:posZ}, velocity:{x:posX*vScale,y:posY*vScale,z:posZ*vScale}, life:null, children:[], mass:size*5000 };
+        const numStars = Math.floor(Math.random()*3) + 1;
+        for(let k=0;k<numStars;k++){
+            const starDist = Math.random()*50;
+            const starAngle = Math.random()*Math.PI*2;
+            const starPos = { x: galaxy.position.x + starDist*Math.cos(starAngle), y: galaxy.position.y + starDist*Math.sin(starAngle), z: galaxy.position.z + Math.random()*10 - 5 };
+            const starSize = Math.floor(Math.random()*10) + 5;
+            const starSystem = createStarSystem(starPos, starSize, `${galaxy.id}.${k+1}`);
+            starSystem.velocity = {...galaxy.velocity};
+            starSystem.parent = galaxy;
+            galaxy.children.push(starSystem);
+        }
+        universe.push(galaxy);
+    }
+    // Comets
+    for(let c=0;c<6;c++){
+        universe.push({ id:`C${c+1}`, size:2, type:'Comet', position:{x:Math.random()*500+400,y:Math.random()*500+400,z:Math.random()*300-150}, velocity:{x:(Math.random()-0.5)*20,y:(Math.random()-0.5)*20,z:(Math.random()-0.5)*20}, life:null, mass:5 });
+    }
+    // Black hole
+    universe.push({ id:999, size:15, type:'Black Hole', position:{x:0,y:0,z:0}, velocity:{x:0,y:0,z:0}, life:null, mass: blackHoleMass });
+    // establish diplomacy links among intelligent planets (random)
+    const allPlanets = [];
+    traverseEntities(universe, e => { if(e.type === 'Planet' && e.life && e.life.intelligent) allPlanets.push(e); });
+    for(let i=0;i<allPlanets.length;i++){
+        for(let j=i+1;j<allPlanets.length;j++){
+            const p1 = allPlanets[i], p2 = allPlanets[j];
+            const relation = Math.random() > 0.925 ? "War" : Math.random() > 0.75 ? "Trade" : "Neutral";
+            p1.life.diplomacy[String(p2.id)] = relation;
+            p2.life.diplomacy[String(p1.id)] = relation;
+        }
+    }
+    return universe;
+}
+
+/* -------------------------
+   RL control: choose action & apply
+   ------------------------- */
+function policyAct(planet){
+    // build obs, forward through policy net
+    const obs = buildObservation(planet);
+    const forwardPol = forwardMLP(planet.policy, obs);
+    // final logits in forwardPol.acts[last]
+    const logits = forwardPol.acts[forwardPol.acts.length - 1];
+    const probs = softmax(logits);
+    // sample action
+    let r = Math.random(), cum = 0, action = 0;
+    for(let i=0;i<probs.length;i++){
+        cum += probs[i];
+        if(r <= cum){ action = i; break; }
+    }
+    // store forward for backprop later and obs/action
+    planet.memory.obs.push(obs);
+    planet.memory.acts.push(action);
+    planet.memory.forwardPolicy.push(forwardPol);
+    // also store value forward
+    const forwardVal = forwardMLP(planet.valueNet, obs);
+    planet.memory.forwardValue.push(forwardVal);
+    return action;
+}
+
+function applyActionToPlanet(planet, action, dt){
+    const life = planet.life;
+    if(!life || !life.intelligent) return;
+    // actions:
+    // 0 Build ships (spend metal, add ships)
+    // 1 Trade (attempt to trade for energy)
+    // 2 Invest infra (spend metal to increase baseGrowthRate)
+    // 3 Conserve (help animals)
+    // 4 Attack (if war exists)
+    if(action === 0){
+        const metalCostPerShip = 0.5;
+        const want = 1; // small deterministic increment per step
+        const canBuild = Math.floor((life.resources.metal||0) / metalCostPerShip);
+        const built = Math.min(canBuild, want);
+        life.resources.metal = Math.max(0, (life.resources.metal||0) - built*metalCostPerShip);
+        life.military.ships += built;
+        life.intelligent.currentAction = "Building Ships";
+    } else if(action === 1){
+        // seek a trade partner
+        let traded = false;
+        for(const targetId in life.diplomacy){
+            if(life.diplomacy[targetId] === 'Trade'){
+                const t = findEntityById(targetId);
+                if(t && t.life && t.life.resources && (t.life.resources.energy||0) > 10){
+                    const tradeAmount = Math.min(15, (t.life.resources.energy||0) * 0.07);
+                    t.life.resources.energy -= tradeAmount;
+                    life.resources.energy += tradeAmount * 0.9;
+                    traded = true;
+                    break;
+                }
+            }
+        }
+        life.intelligent.currentAction = traded ? "Traded Energy" : "Seeking Trade";
+    } else if(action === 2){
+        // invest infra
+        const spend = Math.min(life.resources.metal || 0, 0.3);
+        life.resources.metal = Math.max(0, (life.resources.metal||0) - spend);
+        life.intelligent.baseGrowthRate = (life.intelligent.baseGrowthRate||0.002) + spend * 0.00002;
+        life.intelligent.currentAction = "Investing Infrastructure";
+    } else if(action === 3){
+        if(life.animals){
+            const boost = 1 + 0.01 * dt;
+            life.animals.population = Math.min(life.animals.max, life.animals.population * boost);
+        }
+        life.intelligent.currentAction = "Conservation";
+    } else if(action === 4){
+        // attempt attack if War relation exists
+        for(const targetId in life.diplomacy){
+            if(life.diplomacy[targetId] === 'War'){
+                const t = findEntityById(targetId);
+                if(t && t.life && t.life.military){
+                    const myStrength = life.military.ships * (1 + (life.military.defense||0)/10);
+                    const theirStrength = t.life.military.ships * (1 + (t.life.military.defense||0)/10);
+                    if(myStrength > theirStrength * 0.9){
+                        const steal = Math.min(40, (t.life.resources && t.life.resources.metal) || 0);
+                        t.life.resources.metal = Math.max(0, (t.life.resources.metal || 0) - steal);
+                        life.resources.metal = (life.resources.metal || 0) + steal * 0.7;
+                        const lost = Math.floor(Math.random() * Math.min(life.military.ships, 3));
+                        life.military.ships = Math.max(0, life.military.ships - lost);
+                    } else {
+                        const lost = Math.floor(Math.random() * Math.min(life.military.ships, 4));
+                        life.military.ships = Math.max(0, life.military.ships - lost);
+                    }
+                }
+                break;
+            }
+        }
+        life.intelligent.currentAction = "At War";
+    }
+}
+
+/* -------------------------
+   Reward shaping
+   ------------------------- */
+function computeImmediateReward(planet){
+    // reward = population delta + resource balance + small survival bonus - military losses
+    const life = planet.life;
+    if(!life || !life.intelligent) return 0;
+    const intel = life.intelligent;
+    // pop component: normalized
+    const popScore = Math.tanh((intel.population || 0) / Math.max(1, life.maxPopulation || 1e8));
+    const resSum = (life.resources && (life.resources.food + life.resources.metal + life.resources.energy)) || 0;
+    const resScore = Math.tanh(resSum / 2000);
+    const milScore = Math.tanh(((life.military && life.military.ships) || 0) / 20);
+    const reward = popScore * 0.6 + resScore * 0.3 + milScore * 0.1;
+    return reward;
+}
+
+/* -------------------------
+   Training step after episode
+   ------------------------- */
+function trainOnEpisode(planet){
+    const mem = planet.memory;
+    const T = mem.rewards.length;
+    if(T === 0) return;
+    // compute discounted returns
+    const returns = discountRewards(mem.rewards, GAMMA);
+    // normalize returns (helpful)
+    let mean = 0;
+    for(let i=0;i<returns.length;i++) mean += returns[i];
+    mean /= returns.length;
+    let std = 0;
+    for(let i=0;i<returns.length;i++) std += (returns[i] - mean)*(returns[i] - mean);
+    std = Math.sqrt(std / returns.length + 1e-8);
+    for(let i=0;i<returns.length;i++) returns[i] = (returns[i] - mean) / std;
+
+    // For each step, compute advantage = return - value(s)
+    for(let t=0;t<T;t++){
+        const forwardVal = mem.forwardValue[t];
+        const v = forwardVal.acts[forwardVal.acts.length - 1][0];
+        const advantage = returns[t] - v;
+        // gradients
+        const gradPolicy = policyGradientsFromExample(planet.policy, mem.forwardPolicy[t], mem.acts[t], advantage);
+        const gradValue = valueGradientsFromExample(planet.valueNet, mem.forwardValue[t], returns[t]);
+        // apply updates (simple SGD)
+        applyGradients(planet.policy, gradPolicy, POLICY_LR);
+        applyGradients(planet.valueNet, gradValue, VALUE_LR);
+    }
+
+    planet.trainSteps += 1;
+    // clear memory
+    planet.memory = { obs:[], acts:[], rewards:[], forwardPolicy:[], forwardValue:[] };
+}
+
+/* -------------------------
+   Main Universe / Physics / Life Update
+   ------------------------- */
+
+function findEntityById(id){
+    id = String(id);
+    let found = null;
+    traverseEntities(universe, e => { if(found) return; if(String(e.id) === id) found = e; });
+    return found;
+}
+
+function updateUniverse(universeArr, dt){
+    // camera smoothing
+    currentScale += (targetScale - currentScale) * zoomSpeed;
+    if(focusEntity){ targetPosition.x = focusEntity.position.x; targetPosition.y = focusEntity.position.y; targetPosition.z = focusEntity.position.z; } else { targetPosition.x = targetPosition.y = targetPosition.z = 0; }
+
+    traverseEntities(universeArr, entity => {
+        if(entity.type === 'Black Hole') return;
+        let ax=0, ay=0, az=0;
+        const dxC = -entity.position.x, dyC = -entity.position.y, dzC = -entity.position.z;
+        const distC2 = dxC*dxC + dyC*dyC + dzC*dzC; const distC = Math.sqrt(distC2) || 1; const safeDist = Math.max(distC, 1);
+        const strengthFactor = (!focusEntity || (focusEntity && focusEntity.id === entity.id)) ? 1 : 0.01;
+        const sunG = G * sunMass * strengthFactor / (safeDist*safeDist);
+        const bhG = G * blackHoleMass * strengthFactor / (safeDist*safeDist);
+        const totalCentral = sunG + bhG;
+        ax += dxC/distC * totalCentral; ay += dyC/distC * totalCentral; az += dzC/distC * totalCentral;
+
+        if(entity.parent && entity.parent.mass){
+            const p = entity.parent;
+            const dx = p.position.x - entity.position.x, dy = p.position.y - entity.position.y, dz = p.position.z - entity.position.z;
+            const dist2 = dx*dx + dy*dy + dz*dz; const dist = Math.sqrt(dist2) || 1;
+            const force = G * p.mass / Math.max(dist2, 0.0001);
+            ax += force * dx/dist; ay += force * dy/dist; az += force * dz/dist;
+            entity.velocity.x *= 0.9999; entity.velocity.y *= 0.9999; entity.velocity.z *= 0.9999;
+        }
+
+        if(!entity.absorbed){
+            entity.velocity.x += ax * dt; entity.velocity.y += ay * dt; entity.velocity.z += az * dt;
+            if(!focusEntity || entity.id === focusEntity.id){ entity.position.x *= (1 + expansionRate); entity.position.y *= (1 + expansionRate); entity.position.z *= (1 + expansionRate); }
+            entity.position.x += entity.velocity.x * dt; entity.position.y += entity.velocity.y * dt; entity.position.z += entity.velocity.z * dt;
+        }
+        const distToBH = Math.sqrt(entity.position.x*entity.position.x + entity.position.y*entity.position.y + entity.position.z*entity.position.z);
+        if(distToBH < 15 + (entity.size || 0)) entity.absorbed = true;
+
+        // Life + RL
+        if(entity.life && entity.type === 'Planet' && entity.life.intelligent){
+            // 1) Run policy to select an action for this step
+            if(!entity.policy) attachRLToPlanet(entity);
+            const action = policyAct(entity);
+            // 2) Apply that action
+            applyActionToPlanet(entity, action, dt);
+
+            // 3) Generic life dynamics (population growth & resources)
+            const life = entity.life;
+            const intel = life.intelligent;
+            // growth factor
+            let totalPop = 0;
+            for(const k in life) if(k !== 'maxPopulation' && k !== 'baseGrowthRate' && k !== 'currentAction' && k !== 'resources' && k !== 'military' && k !== 'diplomacy') totalPop += (life[k].population||0);
+            const saturation = life.maxPopulation ? totalPop / life.maxPopulation : 0;
+            const growthFactor = Math.max(0, 1 - saturation);
+            // basic population growth
+            intel.population = Math.min(intel.population + intel.population * intel.baseGrowthRate * growthFactor * dt, life.maxPopulation * 0.5);
+            intel.population = Math.max(intel.population, 0);
+            if(intel.population > 5e6 && intel.stage < 2) intel.stage = 2;
+            if(intel.population > 20e6 && intel.stage < 3) intel.stage = 3;
+            // resources passive
+            life.resources.food += intel.population * 0.00005 * dt;
+            life.resources.metal += 0.2 * dt;
+            life.resources.energy += 0.15 * dt;
+            life.resources.energy = Math.max(0, life.resources.energy - (life.military.ships||0) * 0.02 * dt);
+
+            // 4) Reward buffer
+            const r = computeImmediateReward(entity);
+            entity.memory.rewards.push(r);
+            // cap memory
+            if(entity.memory.rewards.length > MAX_TRAJ_PER_PLANET){
+                // drop oldest (shouldn't normally happen)
+                entity.memory.rewards.shift(); entity.memory.obs.shift(); entity.memory.acts.shift(); entity.memory.forwardPolicy.shift(); entity.memory.forwardValue.shift();
+            }
+        } else {
+            // Non-intelligent life growth for other bodies if present
+            if(entity.life){
+                for(const k in entity.life){
+                    if(k === 'maxPopulation' || k === 'baseGrowthRate') continue;
+                    const lifeData = entity.life[k];
+                    if(lifeData.population && lifeData.growthRate) lifeData.population = Math.min(lifeData.population + (lifeData.population * lifeData.growthRate * 0.01 * dt), lifeData.max || 1e12);
+                }
+            }
+        }
+    });
+
+    // Remove absorbed
+    for(let i=universeArr.length-1;i>=0;i--) if(universeArr[i].absorbed) universeArr.splice(i,1);
+}
+
+/* -------------------------
+   Drawing & UI
+   ------------------------- */
+function drawEntity(entity, time, isRoot=false){
+    let shouldDraw = false;
+    if(!focusEntity) shouldDraw = true;
+    else {
+        if(entity.id === focusEntity.id) shouldDraw = true;
+        if(entity.parent && entity.parent.id === focusEntity.id) shouldDraw = true;
+        if(focusEntity.parent && entity.id === focusEntity.parent.id) shouldDraw = true;
+        if(focusEntity.type === 'Galaxy' && entity.id !== focusEntity.id && String(entity.id).startsWith(focusEntity.id + '.')) shouldDraw = true;
+        if(focusEntity.type === 'Star' && entity.parent && entity.parent.id === focusEntity.id) shouldDraw = true;
+    }
+    if(shouldDraw){
+        const proj = project3D(entity.position.x, entity.position.y, entity.position.z);
+        const radius = Math.max(0.2, entity.size * 2 * proj.sizeScale);
+        const projX = proj.x / DPR;
+        const projY = proj.y / DPR;
+        const rad = radius / DPR;
+        if(rad > 0.1 && projX > -rad && projX < window.innerWidth + rad && projY > -rad && projY < window.innerHeight + rad){
+            let color = '#fff';
+            if(entity.type === 'Planet' && entity.life && entity.life.intelligent){ const stage = entity.life.intelligent.stage; color = stage===1? '#00f' : stage===2? '#0f0' : '#0ff'; }
+            else switch(entity.type){ case 'Star': color='#ff0'; break; case 'Comet': color='#ccc'; break; case 'Galaxy': color='#f0f'; break; case 'Black Hole': color='#000'; break; default: color='#fff'; break; }
+            ctx.save();
+            ctx.beginPath(); ctx.arc(projX * DPR, projY * DPR, rad * DPR, 0, Math.PI*2);
+            ctx.fillStyle = color; ctx.fill();
+            if(focusEntity && entity.id === focusEntity.id){ ctx.strokeStyle='red'; ctx.lineWidth = Math.max(1, DPR*2); ctx.stroke(); }
+            ctx.restore();
+        }
+    }
+    if(entity.children) entity.children.forEach(c => drawEntity(c, time));
+}
+
+function drawUniverse(universeArr, time){
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    // draw central sun and BH
+    if(!focusEntity || focusEntity.type === 'Galaxy' || focusEntity.type === 'Comet'){
+        const sunProj = project3D(0,0,0);
+        const sunRad = Math.max(2, 20 * sunProj.sizeScale);
+        ctx.beginPath(); ctx.arc(sunProj.x/DPR, sunProj.y/DPR, sunRad, 0, Math.PI*2); ctx.fillStyle = '#ffa500'; ctx.fill();
+        const bh = universeArr.find(e => e.type==='Black Hole');
+        if(bh){ const p = project3D(bh.position.x, bh.position.y, bh.position.z); const bhRad = Math.max(1, bh.size*4*p.sizeScale); ctx.beginPath(); ctx.arc(p.x/DPR, p.y/DPR, bhRad, 0, Math.PI*2); ctx.strokeStyle = 'rgba(68,68,68,0.35)'; ctx.stroke(); }
+    }
+    universeArr.forEach(e => drawEntity(e, time, true));
+
+    // INFO panel
+    let infoHTML = `Simulation Time: ${time.toFixed(2)} s<br>`;
+    infoHTML += `Current View: <b>${focusEntity ? focusEntity.type + ' ' + focusEntity.id : 'Universe/Galaxy View'}</b><br>`;
+    if(focusEntity){
+        const entity = focusEntity;
+        infoHTML += `<br>--- <b>${entity.type} ${entity.id}</b> ---<br>`;
+        infoHTML += `Size: ${entity.size}<br>`;
+        infoHTML += `Pos: (${entity.position.x.toFixed(0)}, ${entity.position.y.toFixed(0)}, ${entity.position.z.toFixed(0)})<br>`;
+        if(entity.life && entity.life.intelligent){
+            const intel = entity.life.intelligent, life = entity.life;
+            infoHTML += `<br>-- INTELLIGENCE (${intel.stage===3?'Advanced':intel.stage===2?'Industrial':'Primitive'}) --<br>`;
+            infoHTML += `AI Action: <span style="color:#0f0">${intel.currentAction}</span><br>`;
+            if(life.resources){
+                infoHTML += `<br>-- RESOURCES --<br>`;
+                for(const r in life.resources) infoHTML += `${r.charAt(0).toUpperCase()+r.slice(1)}: ${Math.floor(life.resources[r])}<br>`;
+            }
+            if(life.military){
+                infoHTML += `<br>-- MILITARY --<br>`;
+                infoHTML += `Ships: ${Math.floor(life.military.ships)}<br>`;
+                infoHTML += `Defense: ${Math.floor(life.military.defense)}<br>`;
+            }
+            if(life.diplomacy && Object.keys(life.diplomacy).length>0){
+                infoHTML += `<br>-- DIPLOMACY --<br>`;
+                for(const tid in life.diplomacy){
+                    const rel = life.diplomacy[tid];
+                    let color='white'; if(rel==='War') color='red'; else if(rel==='Trade') color='yellow';
+                    const ent = findEntityById(tid);
+                    if(ent) infoHTML += `vs ${ent.type} ${tid}: <span style="color:${color}">${rel}</span><br>`;
+                }
+            }
+            infoHTML += `<br>-- POPULATION --<br>`;
+            infoHTML += `Intelligent: ${Math.floor(intel.population)} (Growth: ${(intel.baseGrowthRate*100).toFixed(3)}%)<br>`;
+            infoHTML += `<div class="small">Training steps: ${entity.trainSteps || 0}</div>`;
+        } else if(entity.life){
+            for(const k in entity.life){ if(k==='maxPopulation' || k==='baseGrowthRate') continue; infoHTML += ` ${k.charAt(0).toUpperCase()+k.slice(1)}: ${Math.floor(entity.life[k].population)}<br>`; }
+        }
+        if(entity.children && entity.children.length>0){
+            infoHTML += `<br>Children (Click to Zoom):<ul class="zoom-list">`;
+            entity.children.forEach(child => {
+                const link = `<span class="zoom-link" onclick="zoomToEntity('${String(child.id)}')">${child.type} ${child.id} (Size: ${child.size})</span>`;
+                infoHTML += `<li>${link}</li>`;
+            });
+            infoHTML += `</ul>`;
+        }
+    } else {
+        infoHTML += `<br>Total Galaxies: ${universeArr.filter(e=>e.type==='Galaxy').length}<br>`;
+        infoHTML += `Total Comets: ${universeArr.filter(e=>e.type==='Comet').length}<br>`;
+        infoHTML += `<br>Top-Level Entities (Click to Zoom):<ul class="zoom-list">`;
+        universeArr.filter(e => e.type === 'Galaxy' || e.type === 'Comet').forEach(e => {
+            const extra = e.type === 'Galaxy' ? ` (Stars: ${e.children.length})` : '';
+            const link = `<span class="zoom-link" onclick="zoomToEntity('${String(e.id)}')">${e.type} ${e.id}${extra}</span>`;
+            infoHTML += `<li>${link}</li>`;
+        });
+        infoHTML += `</ul>`;
+    }
+    infoDiv.innerHTML = infoHTML;
+    backButton.style.display = focusEntity ? 'block' : 'none';
+}
+
+/* -------------------------
+   Interactions: zoom & pick
+   ------------------------- */
+window.zoomToEntity = function(id){
+    const ent = findEntityById(id);
+    if(!ent) return;
+    focusEntity = ent;
+    if (focusEntity.type === 'Planet') targetScale = 10000;
+    else if (focusEntity.type === 'Star') targetScale = 3000;
+    else if (focusEntity.type === 'Galaxy' || focusEntity.type === 'Comet') targetScale = 1000;
+    else targetScale = 500;
+    targetPosition.x = focusEntity.position.x; targetPosition.y = focusEntity.position.y; targetPosition.z = focusEntity.position.z;
+};
+backButton.addEventListener('click', ()=>{ if(focusEntity){ if(focusEntity.parent){ const p = focusEntity.parent; focusEntity = p; if(p.type==='Star') targetScale=3000; else if(p.type==='Galaxy') targetScale=1000; else { focusEntity=null; targetScale=500; } } else { focusEntity=null; targetScale=500; } } else targetScale=500; });
+
+canvas.addEventListener('click', ev => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = (ev.clientX - rect.left);
+    const my = (ev.clientY - rect.top);
+    let closest = null, cd = Infinity;
+    traverseEntities(universe, e => {
+        const visible = (!focusEntity) || e.id===focusEntity.id || (e.parent && e.parent.id===focusEntity.id) || (focusEntity.parent && e.id===focusEntity.parent.id) || (focusEntity.type==='Galaxy' && String(e.id).startsWith(focusEntity.id + '.')) || (focusEntity.type==='Star' && e.parent && e.parent.id===focusEntity.id);
+        if(!visible) return;
+        const p = project3D(e.position.x, e.position.y, e.position.z);
+        const pX = p.x / DPR, pY = p.y / DPR;
+        const r = Math.max(2, e.size * 2 * p.sizeScale);
+        const dx = pX - mx, dy = pY - my;
+        const d2 = dx*dx + dy*dy;
+        if(d2 < (r+8)*(r+8) && d2 < cd){ cd = d2; closest = e; }
+    });
+    if(closest) zoomToEntity(closest.id);
+});
+
+/* -------------------------
+   Episode bookkeeping & training scheduling
+   ------------------------- */
+let stepCounter = 0;
+function maybeTrainAll(universe){
+    // iterate planets and train if they have a complete episode
+    traverseEntities(universe, e => {
+        if(e.type === 'Planet' && e.life && e.life.intelligent && e.memory && e.memory.rewards){
+            if(e.memory.rewards.length >= EPISODE_STEPS){
+                trainOnEpisode(e);
+            }
+        }
+    });
+}
+
+/* -------------------------
+   Init & animation
+   ------------------------- */
+const universe = createUniverse(5);
+let currentTime = 0;
+function animate(){
+    updateUniverse(universe, dt);
+    drawUniverse(universe, currentTime);
+    currentTime += dt;
+    stepCounter++;
+    if(stepCounter % EPISODE_STEPS === 0){
+        // train on episodes
+        maybeTrainAll(universe);
+    }
+    requestAnimationFrame(animate);
+}
+animate();
+
+/* -------------------------
+   Optional helpers: save/load a planet brain as JSON (not auto-used)
+   ------------------------- */
+function nnToJSON(net){
+    return JSON.stringify({ layers: net.layers, weights: net.weights.map(w => Array.from(w)), biases: net.biases.map(b => Array.from(b)) });
+}
+function nnFromJSON(str){
+    const obj = JSON.parse(str);
+    const net = { layers: obj.layers, weights: [], biases: [] };
+    for(let i=0;i<obj.weights.length;i++){
+        net.weights.push(Float32Array.from(obj.weights[i]));
+        net.biases.push(Float32Array.from(obj.biases[i]));
+    }
+    return net;
+}
+
+const REACTION_DB = {
+    "Combustion_Methane": {
+        reactants: { 'CH4': 1, 'O2': 2 },
+        products: { 'CO2': 1, 'H2O': 2 },
+        energyChange: -890, // Exothermic: releases 890 units
+        requiredTemp: 100
+    },
+    "Water_Synthesis": {
+        reactants: { 'H2': 2, 'O2': 1 },
+        products: { 'H2O': 2 },
+        energyChange: -286,
+        requiredTemp: 150
+    },
+    // Add more reactions here
+};
+
+class ChemicalEnvironment {
+    constructor() {
+        // Initial state of the environment/grid cell
+        this.chemicalInventory = {
+            'C': 10, 'H': 10, 'O': 10, 'N': 10,
+            'CH4': 5, 'O2': 10, 'H2O': 0, 'CO2': 0,
+            'Temperature': 25 // Ambient temperature
+        };
+        this.minTemperature = 25;
+        this.coolingRate = 0.01; // 1% cooling per step
+    }
+
+    // --- Core Chemistry Logic ---
+    _executeReaction(reactionName, scaleFactor = 1) {
+        const reaction = REACTION_DB[reactionName];
+        if (!reaction) return false;
+
+        // 1. Check if temperature is met
+        if (this.chemicalInventory.Temperature < reaction.requiredTemp) {
+            return false;
+        }
+
+        // 2. Find the Limiting Reagent (max possible scale)
+        let maxScale = scaleFactor;
+        for (const [chemical, amount] of Object.entries(reaction.reactants)) {
+            if (this.chemicalInventory[chemical] === undefined) {
+                // Should only happen if a key is missing from the initial inventory
+                return false; 
+            }
+            maxScale = Math.min(maxScale, this.chemicalInventory[chemical] / amount);
+        }
+
+        const finalScale = Math.floor(maxScale);
+        if (finalScale < 1) {
+            return false;
+        }
+
+        // 3. Consume reactants and produce products (Mass Balance)
+        for (const [chemical, amount] of Object.entries(reaction.reactants)) {
+            this.chemicalInventory[chemical] -= amount * finalScale;
+        }
+        for (const [chemical, amount] of Object.entries(reaction.products)) {
+            // Ensure product key exists before adding
+            if (this.chemicalInventory[chemical] === undefined) {
+                 this.chemicalInventory[chemical] = 0;
+            }
+            this.chemicalInventory[chemical] += amount * finalScale;
+        }
+
+        // 4. Update temperature/energy
+        // Adjust temperature based on energy change
+        const tempChange = (reaction.energyChange / 50) * finalScale; 
+        this.chemicalInventory.Temperature += tempChange;
+        
+        return true;
+    }
+
+    // --- The Main Simulation Step ---
+    step(agentAction) {
+        // 1. Process agent's action (e.g., if the agent chose to 'IGNITE')
+        if (agentAction.type === 'TRIGGER_REACTION' && agentAction.name === 'Combustion_Methane') {
+            // Let the agent trigger a reaction at a specific scale
+            this._executeReaction(agentAction.name, agentAction.scale || 5);
+        } else if (agentAction.type === 'APPLY_HEAT') {
+             // Example action: Agent adds heat directly
+            this.chemicalInventory.Temperature += agentAction.amount || 10;
+        }
+
+        // 2. Simulate passive chemical effects (run all reactions at a small, passive scale)
+        for (const reactionName in REACTION_DB) {
+            // Passive scale is set to 1, or lower if you want slower background kinetics
+            this._executeReaction(reactionName, 1); 
+        }
+
+        // 3. Apply natural environmental effects (Dissipation)
+        this.chemicalInventory.Temperature *= (1 - this.coolingRate);
+        this.chemicalInventory.Temperature = Math.max(this.minTemperature, this.chemicalInventory.Temperature);
+        
+        // 4. Generate observation and reward (The output for the AI)
+        const observation = Object.values(this.chemicalInventory);
+        const reward = this._calculateReward(); // Placeholder for your specific reward logic
+
+        return { observation, reward, done: false };
+    }
+
+    _calculateReward() {
+        // Example: Reward for high water concentration, penalty for high temperature
+        return (this.chemicalInventory.H2O * 10) - (this.chemicalInventory.Temperature);
+    }
+}
+
+
+// Example of how your AI model outputs an action for the step function:
+const environment = new ChemicalEnvironment();
+
+// Agent attempts to heat the area
+let action1 = { type: 'APPLY_HEAT', amount: 50 };
+environment.step(action1); 
+
+// Agent then tries to ignite the Methane (if it has enough H2 and O2 nearby)
+let action2 = { type: 'TRIGGER_REACTION', name: 'Combustion_Methane', scale: 10 };
+const { observation, reward } = environment.step(action2);
+
+console.log("New Temperature:", environment.chemicalInventory.Temperature);
+console.log("Resulting Reward:", reward);
+// You can call nnToJSON(planet.policy) in console to get a JSON string for a trained policy.
+// Or load it later with nnFromJSON(jsonStr) and assign to planet.policy.
+
+</script>
+</body>
+</html>
