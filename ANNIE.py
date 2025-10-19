@@ -10,22 +10,25 @@ def play_sound_async(sound_array):
     """Play a sound asynchronously without spawning extra threads."""
     sd.play(sound_array, samplerate=SAMPLE_RATE, blocking=False)
 
-# --- Base pigeon-language signals ---
-base_pigeon_language = {
-    "gather": [400, 500],
-    "trade": [500, 600],
-    "fight": [700, 800],
-    "social": [300, 400],
-    "reproduce": [600, 700]
+# --- Base pidgin signals (now sequence-ready for creole evolution) ---
+base_pidgin_language = {
+    "gather": [[400, 500]],
+    "trade": [[500, 600]],
+    "fight": [[700, 800]],
+    "social": [[300, 400]],
+    "reproduce": [[600, 700]]
 }
 
-def play_signal(freqs, agent):
-    """Generate and play a chord based on agent traits."""
-    duration = 0.2 + 0.2 * agent.rhythm_complexity
-    t = np.linspace(0, duration, int(SAMPLE_RATE * duration), False)
-    chord = sum(np.sin(2 * np.pi * f * t) for f in freqs) / len(freqs)
-    chord *= 0.25 + 0.25 * agent.harmony_preference
-    play_sound_async(chord)
+def play_signal_sequence(signal_sequence, agent):
+    """Generate and play a sequence of chords based on agent traits."""
+    full_sound = np.zeros(0)
+    for freqs in signal_sequence:
+        duration = 0.2 + 0.2 * agent.rhythm_complexity
+        t = np.linspace(0, duration, int(SAMPLE_RATE * duration), False)
+        chord = sum(np.sin(2 * np.pi * f * t) for f in freqs) / len(freqs)
+        chord *= 0.25 + 0.25 * agent.harmony_preference
+        full_sound = np.concatenate([full_sound, chord])
+    play_sound_async(full_sound)
 
 def decode_signal(freqs):
     """Infer action from average frequency."""
@@ -40,6 +43,10 @@ def decode_signal(freqs):
         return "gather"
     else:
         return "social"
+
+def decode_signal_sequence(freq_sequence):
+    """Decode a sequence of signals into actions."""
+    return [decode_signal(freqs) for freqs in freq_sequence]
 
 # --- Neural network ---
 class NumpyNN:
@@ -106,9 +113,9 @@ class Resource:
 class Environment:
     def __init__(self):
         self.resources = {
-            "food": Resource("food", 50, 5),
-            "energy": Resource("energy", 50, 3),
-            "metal": Resource("metal", 30, 2)
+            "food": Resource("food", 500, 50),
+            "energy": Resource("energy", 500, 30),
+            "metal": Resource("metal", 300, 20)
         }
 
     def regenerate_resources(self):
@@ -118,6 +125,7 @@ class Environment:
 # --- Agent ---
 class Agent:
     ACTIONS = ["gather","trade","fight","social","reproduce"]
+    MAX_SEQUENCE_LENGTH = 2  # max signal sequence length for creole
 
     def __init__(self, name, parent=None):
         self.name = name
@@ -140,14 +148,20 @@ class Agent:
             self.melody_tendency = np.clip(parent.melody_tendency + random.uniform(-0.1,0.1),0,1)
             self.rhythm_complexity = np.clip(parent.rhythm_complexity + random.uniform(-0.1,0.1),0,1)
             self.harmony_preference = np.clip(parent.harmony_preference + random.uniform(-0.1,0.1),0,1)
-            # Inherit and mutate signals
-            self.signal_map = {act:[f+random.uniform(-5,5) for f in freqs] 
-                               for act, freqs in parent.signal_map.items()}
+            # Inherit and mutate signal sequences
+            self.signal_map = {}
+            for act, seqs in parent.signal_map.items():
+                new_seqs = []
+                for freqs in seqs:
+                    mutated = [f + random.uniform(-2,2) for f in freqs]
+                    new_seqs.append(mutated)
+                self.signal_map[act] = new_seqs
         else:
             self.melody_tendency = random.uniform(0,1)
             self.rhythm_complexity = random.uniform(0,1)
             self.harmony_preference = random.uniform(0,1)
-            self.signal_map = {act: freqs[:] for act, freqs in base_pigeon_language.items()}
+            # Initialize signal sequences
+            self.signal_map = {act: seqs[:] for act, seqs in base_pidgin_language.items()}
 
     def get_state(self, env):
         state = [
@@ -181,17 +195,23 @@ class Agent:
     def perceive_music(self, other_agents):
         for other in other_agents:
             if other == self or not other.alive: continue
-            signal_freqs = other.signal_map.get(other.last_action_name, [200])
-            play_signal(signal_freqs, other)
-            perceived_action = decode_signal(signal_freqs)
-            if perceived_action in ["gather","social","trade","reproduce"]:
-                self.trust[other.name] = np.clip(self.trust.get(other.name,0.5)+0.05,0,1)
-                self.cooperation = np.clip(self.cooperation+0.02,0,1)
-                other.signal_map[other.last_action_name] = [f + random.uniform(-2,2) for f in signal_freqs]
-            elif perceived_action == "fight":
-                self.trust[other.name] = np.clip(self.trust.get(other.name,0.5)-0.05,0,1)
-                self.cooperation = np.clip(self.cooperation-0.02,0,1)
-                other.signal_map[other.last_action_name] = [f + random.uniform(-5,5) for f in signal_freqs]
+            signal_seq = other.signal_map.get(other.last_action_name, [[200]])
+            play_signal_sequence(signal_seq, other)
+            perceived_actions = decode_signal_sequence(signal_seq)
+            for perceived_action in perceived_actions:
+                if perceived_action in ["gather","social","trade","reproduce"]:
+                    self.trust[other.name] = np.clip(self.trust.get(other.name,0.5)+0.05,0,1)
+                    self.cooperation = np.clip(self.cooperation+0.02,0,1)
+                    # Mutate the signal slightly
+                    other.signal_map[other.last_action_name] = [
+                        [f + random.uniform(-2,2) for f in freqs] for freqs in signal_seq
+                    ]
+                elif perceived_action == "fight":
+                    self.trust[other.name] = np.clip(self.trust.get(other.name,0.5)-0.05,0,1)
+                    self.cooperation = np.clip(self.cooperation-0.02,0,1)
+                    other.signal_map[other.last_action_name] = [
+                        [f + random.uniform(-5,5) for f in freqs] for freqs in signal_seq
+                    ]
 
     def act(self, env, agents):
         if not self.alive: return
@@ -261,18 +281,19 @@ class Agent:
             reward -= 1
 
         self.learn(reward)
-        play_signal(self.signal_map[choice], self)
+        # Play the chosen signal sequence
+        play_signal_sequence(self.signal_map[choice], self)
 
 # --- Pygame simulation ---
 pygame.init()
 WIDTH, HEIGHT = 800, 600
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Agent Simulation")
+pygame.display.set_caption("ANNIE")
 clock = pygame.time.Clock()
 font = pygame.font.SysFont(None, 24)
 
 env = Environment()
-agents = [Agent("ALEX"), Agent("JOE"), Agent("SAM"), Agent("TAYLOR")]
+agents = [Agent("ALEX"), Agent("JOE"), Agent("SAM"), Agent("JESSE")]
 
 running = True
 step = 0
