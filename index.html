@@ -19,7 +19,6 @@
 <body>
 <div id="info"></div>
 <div id="controls"><button id="backButton" style="display:none">← Zoom Out</button></div>
-<div>Click the orange circle to view the planets</div>
 <canvas id="universe"></canvas>
 <script>
 // =====================
@@ -1018,8 +1017,75 @@ function simulateTick(intel, dt) {
         console.log(`${intel.name} has gone extinct.`);
     }
 }
-food_growth *= min(energy/required_energy, metal/required_metal)
-    
+// ----- Resources -----
+let food = 100;
+let energy = 50;
+let metal = 30;
+let population = 10;
+
+// ----- AI Parameters -----
+const foodGrowthRate = 5;
+const energyConsumptionRate = 2;
+const metalConsumptionRate = 1;
+
+// ----- Simulation Loop -----
+function simulateTick() {
+    // 1️⃣ Update resources
+    if (energy > 0 && metal > 0) {
+        food += foodGrowthRate * Math.min(energy / 10, metal / 10);
+    } else {
+        food += foodGrowthRate * 0.1; // slow growth if scarce
+    }
+
+    // Consume resources
+    energy -= energyConsumptionRate * population;
+    metal -= metalConsumptionRate * population;
+
+    // Prevent negative resources
+    energy = Math.max(0, energy);
+    metal = Math.max(0, metal);
+
+    // 2️⃣ Check survival
+    if (food < population * 2) { // not enough food
+        console.log("AI is rationing food!");
+        population -= 1; // starvation
+        food = Math.max(0, food);
+    }
+
+    if (energy === 0 || metal === 0) {
+        console.log("AI is struggling due to lack of resources!");
+        // AI halts building or research
+    }
+
+    // 3️⃣ AI Decision-making
+    if (energy > 10 && metal > 10) {
+        console.log("AI is expanding!");
+        energy -= 5;
+        metal -= 5;
+    } else {
+        console.log("AI focuses on survival!");
+    }
+
+    // 4️⃣ Random events
+    if (Math.random() < 0.05) { // 5% chance
+        console.log("Disaster! Lost 10 food");
+        food = Math.max(0, food - 10);
+    }
+
+    // 5️⃣ Status update
+    console.log(`Population: ${population}, Food: ${food.toFixed(1)}, Energy: ${energy}, Metal: ${metal}`);
+}
+
+// ----- Run simulation every 500ms -----
+const interval = setInterval(() => {
+    if (population <= 0) {
+        console.log("AI population has perished. Simulation ended.");
+        clearInterval(interval);
+        return;
+    }
+    simulateTick();
+}, 500);
+
 </script>
 </body>
 </html>
