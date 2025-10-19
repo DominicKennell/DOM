@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>DOM Simulation</title>
+<title>DOM</title>
 <style>
 body {
     background: #1e1e1e;
@@ -17,14 +17,31 @@ button { padding: 5px 10px; margin-right: 5px; }
     padding: 5px;
     margin-bottom: 10px;
 }
+.resource-bar {
+    position: relative;
+    background: #222;
+    border: 1px solid #444;
+    margin: 2px 0;
+    width: 200px;
+    height: 18px;
+}
+.resource-fill {
+    position: absolute;
+    height: 100%;
+    background: #66ff66;
+    width: 0%;
+}
 #simulation {
     border: 1px solid #444;
     padding: 10px;
-    max-height: 70vh;
+    max-height: 60vh;
     overflow-y: scroll;
 }
 .agent {
     margin-bottom: 2px;
+    padding: 2px 4px;
+    border-radius: 3px;
+    display: inline-block;
 }
 </style>
 </head>
@@ -38,6 +55,9 @@ button { padding: 5px 10px; margin-right: 5px; }
 <div id="simulation"></div>
 
 <script>
+// --- Shared AudioContext ---
+const audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+
 // --- Neural Network ---
 class NeuralNetwork {
     constructor(inputSize=12, hiddenSize=16, outputSize=5, lr=0.01){
@@ -70,15 +90,10 @@ class NeuralNetwork {
     }
 }
 
-// --- Environment with extra resources ---
+// --- Environment ---
 const environment = {
-    food: 500,
-    energy: 500,
-    metal: 300,
-    water: 400,
-    fire: 200,
-    air: 300,
-    trees: 350
+    food: 500, energy: 500, metal: 300,
+    water: 400, fire: 200, air: 300, trees: 350
 };
 
 // --- Agent ---
@@ -88,11 +103,9 @@ class Agent{
         this.strength=Math.floor(Math.random()*10)+1; this.cooperation=Math.random();
         this.lifetimeReward=0; this.children=[]; this.lastAction="None"; this.memory=[]; this.MAX_MEMORY=5; this.trust={};
         this.generation=generation;
-
         this.melodyTendency=parent ? Math.min(Math.max(parent.melodyTendency+(Math.random()-0.5)*0.2,0),1) : Math.random();
         this.rhythmComplexity=parent ? Math.min(Math.max(parent.rhythmComplexity+(Math.random()-0.5)*0.2,0),1) : Math.random();
         this.harmonyPreference=parent ? Math.min(Math.max(parent.harmonyPreference+(Math.random()-0.5)*0.2,0),1) : Math.random();
-
         if(parent){
             this.signalMap={};
             for(let action in parent.signalMap){
@@ -101,7 +114,6 @@ class Agent{
         } else {
             this.signalMap={gather:[400,500],trade:[500,600],fight:[700,800],social:[300,400],reproduce:[600,700]};
         }
-
         this.nn=new NeuralNetwork();
     }
 
@@ -179,21 +191,23 @@ class Agent{
 
         this.lifetimeReward+=reward;
         if(typeof this.lastActionIdx!=="undefined") this.nn.train(this.lastActionIdx,reward);
-        if(this.alive) this.playSignal();
+        if(this.alive) setTimeout(()=>this.playSignal(), Math.random()*200);
     }
 
     playSignal(){
         const freqs=this.signalMap[this.lastAction];
-        const ctx=new (window.AudioContext||window.webkitAudioContext)();
-        const osc=ctx.createOscillator();
-        osc.type='sine'; osc.frequency.setValueAtTime(freqs[0],ctx.currentTime);
-        osc.connect(ctx.destination);
-        osc.start(); osc.stop(ctx.currentTime+0.2+0.2*this.rhythmComplexity);
+        const osc=audioCtx.createOscillator();
+        const gain=audioCtx.createGain();
+        osc.type='sine';
+        osc.frequency.setValueAtTime(freqs[0]*(0.8+0.4*this.energy/50), audioCtx.currentTime);
+        gain.gain.value = 0.1 + 0.05*this.rhythmComplexity;
+        osc.connect(gain); gain.connect(audioCtx.destination);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.2 + 0.2*this.rhythmComplexity);
     }
 }
 
 // --- Simulation ---
-let agents=[new Agent("ALEX"),new Agent("JOE"),new Agent("SAM"),new Agent("JESSE")];
+let agents=[new Agent("ALEX"),new Agent("JOE"),new Agent("SAM"),new Agent("JESSE"), new Agent("BLAKE")];
 let running=false, stepCount=0, intervalId=null;
 
 function flattenAgents(agentList){
@@ -202,53 +216,59 @@ function flattenAgents(agentList){
     return allAgents;
 }
 
-function updateResources(){
-    const container=document.getElementById("resources");
-    container.innerHTML = `<strong>Resources:</strong> ` +
-        Object.keys(environment).map(r=>`${r}: ${environment[r]}`).join(' | ');
-}
-
 function simulateStep(){
-    try {
-        const allAgents=flattenAgents(agents);
-        const aliveAgents=allAgents.filter(a=>a.alive);
-        aliveAgents.forEach(agent=>agent.act(allAgents));
+    const allAgents=flattenAgents(agents);
+    const aliveAgents=allAgents.filter(a=>a.alive);
+    aliveAgents.forEach(agent=>agent.act(allAgents));
 
-        if(stepCount % 5===0){
-            environment.food = Math.min(environment.food + 50, 1000);
-            environment.energy = Math.min(environment.energy + 30, 1000);
-            environment.metal = Math.min(environment.metal + 20, 1000);
-            environment.air = Math.min(environment.air + 20, 1000);
-            environment.trees = Math.min(environment.trees + 50, 1000);
-            environment.water = Math.min(environment.water + 50, 1000);
-            environment.fire = Math.min(environment.fire + 20, 1000);
-        }
+    if(stepCount%5===0){
+        environment.food=Math.min(environment.food+50,1000);
+        environment.energy=Math.min(environment.energy+30,1000);
+        environment.metal=Math.min(environment.metal+20,1000);
+        environment.air=Math.min(environment.air+20, 1000)
+        environment.trees=Math.min(environment.trees+50, 1000)
+        environment.water=Math.min(environment.water+50, 1000)
+        environment.fire=Math.min(environment.fire+20, 1000)
+    }
 
-        displayLineage(agents);
-        updateResources();
-        stepCount++;
-    } catch(e){ console.error("Simulation step error:", e); }
+    displayResources();
+    displayLineage(agents);
+    stepCount++;
 }
 
-// --- Lineage tree display ---
+// --- Resource bars ---
+function displayResources(){
+    const container=document.getElementById("resources");
+    container.innerHTML='';
+    for(const r in environment){
+        const bar=document.createElement('div'); bar.className='resource-bar';
+        const fill=document.createElement('div'); fill.className='resource-fill';
+        fill.style.width=Math.min(environment[r],1000)/10+'%';
+        bar.textContent=`${r}: ${Math.floor(environment[r])}`;
+        bar.appendChild(fill);
+        container.appendChild(bar);
+    }
+}
+
+// --- Lineage display ---
 const colors=["#FFFFFF","#66CCFF","#99FF66","#FFCC66","#FF6666"];
 function displayLineage(agentList, container=document.getElementById("simulation"), depth=0){
     container.innerHTML='';
     function recurse(agent, depth){
         const div=document.createElement('div'); div.className='agent';
-        const color=colors[Math.min(agent.generation, colors.length-1)];
-        div.style.color=color; div.style.marginLeft=(depth*20)+'px';
+        const color=colors[Math.min(agent.generation,colors.length-1)];
+        div.style.color=color;
+        div.style.marginLeft=(depth*20)+'px';
         div.textContent=`${agent.name} (Gen ${agent.generation}): ${agent.alive?"ALIVE":"DEAD"} | F:${agent.food} E:${agent.energy} | Last:${agent.lastAction} | R:${agent.lifetimeReward.toFixed(1)}`;
         container.appendChild(div);
         agent.children.forEach(child=>recurse(child, depth+1));
     }
-    agentList.forEach(agent=>recurse(agent, depth));
+    agentList.forEach(a=>recurse(a, depth));
 }
 
 // --- Controls ---
 document.getElementById("startBtn").onclick=()=>{ if(!running){ running=true; intervalId=setInterval(simulateStep,500); } };
 document.getElementById("stopBtn").onclick=()=>{ running=false; clearInterval(intervalId); };
-
 </script>
 </body>
 </html>
