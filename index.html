@@ -577,6 +577,29 @@ window.dumpLexicon = function(){
 
 // start gentle ambient
 startAmbient(); setAmbient(0.06);
+
+function flattenAll(list){
+  const out = [];
+  list.forEach(a => {
+    out.push(a); // keep dead agents for visuals
+    if(a.children && a.children.length) out.push(...flattenAll(a.children));
+  });
+  return out;
+}
+
+function cleanUpAgents(){
+  function filterActive(list){
+    return list.filter(a=>a.alive).map(a=>{
+      if(a.children && a.children.length) a.children = filterActive(a.children);
+      return a;
+    });
+  }
+  // only remove dead agents from reproduction/logic, not from visuals
+  const aliveAgents = filterActive(agents);
+  // keep original agents array for visuals
+  agents = aliveAgents.concat(agents.filter(a=>!a.alive));
+}
+
 </script>
 </body>
 </html>
