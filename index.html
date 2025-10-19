@@ -2,19 +2,19 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>DOM</title>
+<title>DOM — Digital Life Simulation</title>
 <style>
-  html,body { height:100%; margin:0; background:#0f0f12; color:#eee; font-family:monospace; }
-  #ui { position:fixed; left:12px; top:12px; z-index:20; width:360px; }
-  #controls { margin-bottom:8px; display:flex; gap:6px; align-items:center; }
-  button,input { font:inherit; padding:6px; background:#222; color:#eee; border:1px solid #333; }
-  #resources { margin-top:8px; border:1px solid #222; padding:8px; background:rgba(0,0,0,0.35); }
-  .resource-bar { height:12px; background:#111; border:1px solid #222; margin:6px 0; width:320px; position:relative; }
-  .resource-fill { height:100%; width:0%; background:#66ff66; transition:width 0.25s linear; }
-  #hud { margin-top:8px; color:#ccc; font-size:13px; }
-  #canvasWrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
-  canvas { display:block; width:100%; height:100%; }
-  #legend { margin-top:6px; font-size:12px; color:#bbb; }
+  html,body{height:100%;margin:0;background:#071017;color:#eee;font-family:monospace}
+  #ui{position:fixed;left:12px;top:12px;z-index:20;width:360px}
+  #controls{display:flex;gap:6px;align-items:center;margin-bottom:8px}
+  button,input{font:inherit;padding:6px;background:#111;border:1px solid #223;color:#eee}
+  #resources{margin-top:6px;border:1px solid #122;padding:8px;background:rgba(10,12,14,0.6)}
+  .resource-bar{height:12px;background:#0b0b0d;border:1px solid #122;margin:6px 0;width:320px;position:relative}
+  .resource-fill{height:100%;width:0%;background:#66ff66;transition:width 0.25s linear}
+  #hud{margin-top:8px;color:#cbd5e1;font-size:13px}
+  #canvasWrap{position:fixed;inset:0;display:block}
+  canvas{display:block;width:100%;height:100%}
+  .legend{font-size:12px;color:#9fb1c8;margin-top:6px}
 </style>
 </head>
 <body>
@@ -22,93 +22,45 @@
     <div id="controls">
       <button id="startBtn">Start</button>
       <button id="stopBtn">Stop</button>
-      <label style="color:#bbb">Step(ms):<input id="intervalInput" type="number" value="450" style="width:70px; margin-left:6px;"></label>
+      <label style="color:#9fb1c8">Step(ms):
+        <input id="intervalInput" type="number" value="400" style="width:72px;margin-left:6px" />
+      </label>
     </div>
     <div id="resources"></div>
     <div id="hud">
-      <div id="popInfo">Population: 0</div>
-      <div id="genInfo">Generations (max visible hue): —</div>
-      <div id="legend">Dots: agents (color = melody trait; brightness/pulse = energy)</div>
+      <div id="popInfo">Population: —</div>
+      <div id="genInfo">Max gen: —</div>
+      <div class="legend">Dots = agents. Hue = melodic identity. Pulse = energy. Clusters harmonize.</div>
     </div>
   </div>
 
-  <div id="canvasWrap"><canvas id="simCanvas"></canvas></div>
+  <div id="canvasWrap"><canvas id="canvas"></canvas></div>
 
 <script>
-// -------------------- Setup --------------------
-const canvas = document.getElementById('simCanvas');
-const ctx = canvas.getContext('2d', { alpha:true });
+// ===================== Utilities & Audio =====================
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
 function resize(){ canvas.width = innerWidth; canvas.height = innerHeight; }
 addEventListener('resize', resize);
 resize();
 
-// Shared audio
 const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-let ambientGainNode = null;
+let ambientNode = null;
 
-// util
-const rand = (a,b=0) => b===0 ? Math.random()*a : a + Math.random()*(b-a);
-const choice = arr => arr[Math.floor(Math.random()*arr.length)];
-const clamp = (x,a,b) => Math.max(a, Math.min(b, x));
-const now = ()=> audioCtx.currentTime;
-
-// -------------------- Globals --------------------
-let recentSignals = []; // hearing buffer for each step
-let stepInterval = 450;
-let stepTimer = null;
-let running = false;
-let stepCount = 0;
-
-// -------------------- Environment --------------------
-const environment = { food:500, energy:500, metal:300, water:400, fire:200, air:300, trees:350 };
-
-// -------------------- Neural Net (small) --------------------
-class NeuralNetwork {
-  constructor(inputSize=16, hidden=20, out=5, lr=0.02){
-    this.inputSize = inputSize; this.hidden = hidden; this.out = out; this.lr = lr;
-    this.W1 = Array.from({length:hidden}, ()=>Array.from({length:inputSize}, ()=>rand(-0.1,0.1)));
-    this.b1 = Array(hidden).fill(0);
-    this.W2 = Array.from({length:out}, ()=>Array.from({length:hidden}, ()=>rand(-0.1,0.1)));
-    this.b2 = Array(out).fill(0);
-  }
-  tanh(x){ return Math.tanh(x); }
-  dtanh(y){ return 1-y*y; }
-  softmax(arr){ const m=Math.max(...arr); const exps=arr.map(v=>Math.exp(v-m)); const s=exps.reduce((a,b)=>a+b,0); return exps.map(v=>v/s); }
-  forward(x){
-    this.x = x.slice();
-    this.z1 = this.W1.map((row,i)=> row.reduce((s,v,j)=> s + v*x[j], 0) + this.b1[i]);
-    this.a1 = this.z1.map(v=>this.tanh(v));
-    this.z2 = this.W2.map((row,i)=> row.reduce((s,v,j)=> s + v*this.a1[j], 0) + this.b2[i]);
-    this.a2 = this.softmax(this.z2);
-    return this.a2;
-  }
-  train(idx, reward){
-    const dZ2 = this.a2.slice(); dZ2[idx] -= 1; for(let i=0;i<dZ2.length;i++) dZ2[i]*=reward;
-    const dW2 = this.W2.map((row,i)=> row.map((v,j)=> dZ2[i]*this.a1[j]));
-    const db2 = dZ2.slice();
-    const da1 = Array(this.hidden).fill(0);
-    for(let i=0;i<this.hidden;i++) for(let j=0;j<this.out;j++) da1[i] += this.W2[j][i]*dZ2[j];
-    const dz1 = da1.map((v,i)=> v*this.dtanh(this.a1[i]));
-    const dW1 = this.W1.map((row,i)=> row.map((v,j)=> dz1[i]*this.x[j]));
-    const db1 = dz1.slice();
-    // apply
-    for(let i=0;i<this.out;i++){ for(let j=0;j<this.hidden;j++) this.W2[i][j] -= this.lr * dW2[i][j]; this.b2[i] -= this.lr * db2[i]; }
-    for(let i=0;i<this.hidden;i++){ for(let j=0;j<this.inputSize;j++) this.W1[i][j] -= this.lr * dW1[i][j]; this.b1[i] -= this.lr * db1[i]; }
-  }
-}
-
-// -------------------- Musical helpers --------------------
+function rand(a,b=0){ return b===0 ? Math.random()*a : a + Math.random()*(b-a); }
+function choice(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
+function clamp(x,a,b){ return Math.max(a, Math.min(b, x)); }
 function mkMelody(base){
   const len = Math.floor(rand(2,5));
   const out = [];
   for(let i=0;i<len;i++){
-    const shift = rand(-30,30) + (Math.random()<0.08 ? (Math.random()<0.5?-120:120) : 0);
+    const shift = rand(-28,28) + (Math.random()<0.08 ? (Math.random()<0.5?-120:120) : 0);
     out.push(Math.max(70, base + shift));
   }
   return out;
 }
 function melodySimilarity(m1,m2){
-  if(!m1 || !m2 || m1.length===0 || m2.length===0) return 0;
+  if(!m1||!m2||m1.length===0||m2.length===0) return 0;
   const L = Math.max(m1.length,m2.length);
   let s=0;
   for(let i=0;i<L;i++){
@@ -118,46 +70,82 @@ function melodySimilarity(m1,m2){
   const mse = s / L;
   return Math.exp(-mse / (120*120));
 }
-function playMelody(melody, noteDur=0.10, volume=0.07){
+function playMelody(melody, noteDur=0.1, vol=0.06){
+  // keep volumes low; schedule short sine notes
   const start = audioCtx.currentTime + 0.01;
-  const master = audioCtx.createGain(); master.gain.setValueAtTime(volume, start); master.connect(audioCtx.destination);
+  const master = audioCtx.createGain(); master.gain.setValueAtTime(vol, start); master.connect(audioCtx.destination);
   melody.forEach((f,i)=>{
-    const t = start + i * noteDur;
+    const t = start + i*noteDur;
     const osc = audioCtx.createOscillator();
     const g = audioCtx.createGain();
     osc.type = 'sine';
     osc.frequency.setValueAtTime(f, t);
-    g.gain.setValueAtTime(0.0, t);
-    g.gain.linearRampToValueAtTime(volume, t + 0.01);
+    g.gain.setValueAtTime(0, t);
+    g.gain.linearRampToValueAtTime(vol, t + 0.01);
     g.gain.linearRampToValueAtTime(0, t + noteDur - 0.01);
     osc.connect(g); g.connect(master);
     osc.start(t); osc.stop(t + noteDur);
   });
 }
-
-// gentle ambient pad (if few agents alive)
 function startAmbient(){
-  if(ambientGainNode) return;
-  const o = audioCtx.createOscillator();
+  if(ambientNode) return;
+  const osc = audioCtx.createOscillator();
   const g = audioCtx.createGain();
-  o.type = 'sine';
-  o.frequency.setValueAtTime(80, audioCtx.currentTime);
-  g.gain.setValueAtTime(0.0, audioCtx.currentTime);
-  o.connect(g); g.connect(audioCtx.destination);
-  o.start();
-  ambientGainNode = { osc:o, gain:g };
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(60, audioCtx.currentTime);
+  g.gain.setValueAtTime(0, audioCtx.currentTime);
+  osc.connect(g); g.connect(audioCtx.destination);
+  osc.start();
+  ambientNode = {osc, gain: g};
 }
-function setAmbientLevel(level){ // 0..1
-  if(!ambientGainNode) startAmbient();
-  ambientGainNode.gain.gain.cancelScheduledValues(audioCtx.currentTime);
-  ambientGainNode.gain.gain.setTargetAtTime(level*0.04, audioCtx.currentTime, 0.2);
+function setAmbient(level){
+  if(!ambientNode) startAmbient();
+  ambientNode.gain.gain.cancelScheduledValues(audioCtx.currentTime);
+  ambientNode.gain.gain.setTargetAtTime(level*0.04, audioCtx.currentTime, 0.2);
 }
 
-// -------------------- Agent (dots) --------------------
+// ===================== Neural Net (small) =====================
+class NeuralNetwork {
+  constructor(inputSize=16, hidden=20, output=5, lr=0.02){
+    this.inputSize=inputSize; this.hidden=hidden; this.output=output; this.lr=lr;
+    this.W1 = Array.from({length:this.hidden}, ()=>Array.from({length:this.inputSize}, ()=>rand(-0.1,0.1)));
+    this.b1 = Array(this.hidden).fill(0);
+    this.W2 = Array.from({length:this.output}, ()=>Array.from({length:this.hidden}, ()=>rand(-0.1,0.1)));
+    this.b2 = Array(this.output).fill(0);
+  }
+  tanh(x){ return Math.tanh(x); }
+  dtanh(y){ return 1 - y*y; }
+  softmax(arr){ const m=Math.max(...arr); const exps=arr.map(v=>Math.exp(v-m)); const s=exps.reduce((a,b)=>a+b,0); return exps.map(v=>v/s); }
+  forward(x){
+    this.x = x.slice();
+    this.z1 = this.W1.map((row,i)=>row.reduce((s,v,j)=>s+v*x[j],0) + this.b1[i]);
+    this.a1 = this.z1.map(v=>this.tanh(v));
+    this.z2 = this.W2.map((row,i)=>row.reduce((s,v,j)=>s+v*this.a1[j],0) + this.b2[i]);
+    this.a2 = this.softmax(this.z2);
+    return this.a2;
+  }
+  train(idx, reward){
+    const dZ2 = this.a2.slice(); dZ2[idx] -= 1; for(let i=0;i<dZ2.length;i++) dZ2[i]*=reward;
+    const dW2 = this.W2.map((row,i)=>row.map((v,j)=>dZ2[i]*this.a1[j])); const db2 = dZ2.slice();
+    const da1 = Array(this.hidden).fill(0);
+    for(let i=0;i<this.hidden;i++) for(let j=0;j<this.output;j++) da1[i]+=this.W2[j][i]*dZ2[j];
+    const dz1 = da1.map((v,i)=>v*this.dtanh(this.a1[i]));
+    const dW1 = this.W1.map((row,i)=>row.map((v,j)=>dz1[i]*this.x[j])); const db1 = dz1.slice();
+    for(let i=0;i<this.output;i++){ for(let j=0;j<this.hidden;j++) this.W2[i][j] -= this.lr * dW2[i][j]; this.b2[i] -= this.lr * db2[i]; }
+    for(let i=0;i<this.hidden;i++){ for(let j=0;j<this.inputSize;j++) this.W1[i][j] -= this.lr * dW1[i][j]; this.b1[i] -= this.lr * db1[i]; }
+  }
+}
+
+// ===================== Environment =====================
+const environment = { food:500, energy:500, metal:300, water:400, fire:200, air:300, trees:350 };
+
+// ===================== Global hearing buffer =====================
+let recentSignals = []; // {sender, action, melody:Array, rhythm}
+
+// ===================== Agent (swarm dot) =====================
 class Agent {
-  constructor(name, parent=null, generation=0){
-    this.name = name;
-    this.food = 30; this.energy = 30; this.metal = 8;
+  constructor(parent=null, generation=0){
+    this.food = 26; this.energy = 26; this.metal = 8;
     this.alive = true;
     this.strength = Math.floor(rand(1,10));
     this.cooperation = Math.random();
@@ -168,30 +156,28 @@ class Agent {
     this.MAX_MEMORY = 6;
     this.trust = {};
     this.generation = generation;
-    // spatial
+
+    // spatial initial
     if(parent){
-      // spawn near parent
-      const px = parent.x || rand(canvas.width*0.2, canvas.width*0.8);
-      const py = parent.y || rand(canvas.height*0.2, canvas.height*0.8);
-      this.x = clamp(px + rand(-40,40), 40, canvas.width-40);
-      this.y = clamp(py + rand(-40,40), 40, canvas.height-40);
+      const px = parent.x; const py = parent.y;
+      this.x = clamp(px + rand(-40,40), 30, canvas.width - 30);
+      this.y = clamp(py + rand(-40,40), 30, canvas.height - 30);
     } else {
       this.x = rand(canvas.width*0.2, canvas.width*0.8);
       this.y = rand(canvas.height*0.2, canvas.height*0.8);
     }
-    this.vx = rand(-0.3,0.3); this.vy = rand(-0.3,0.3);
+    this.vx = rand(-0.4,0.4); this.vy = rand(-0.4,0.4);
 
-    // musical traits
+    // musical traits & phrases
     if(parent){
       this.melodyTendency = clamp(parent.melodyTendency + rand(-0.12,0.12), 0,1);
       this.rhythmComplexity = clamp(parent.rhythmComplexity + rand(-0.12,0.12), 0,1);
       this.harmonyPreference = clamp(parent.harmonyPreference + rand(-0.12,0.12), 0,1);
-      // inherit and mutate phrases
       this.signalMap = {};
       for(const a in parent.signalMap){
         let p = parent.signalMap[a].slice();
-        if(Math.random() < 0.15 && p.length>1) p.splice(Math.floor(rand(0,p.length)),1);
-        if(Math.random() < 0.22) p.splice(Math.floor(rand(0,p.length+1)),0, (p.reduce((s,v)=>s+v,0)/p.length) + rand(-30,30));
+        if(Math.random() < 0.16 && p.length>1) p.splice(Math.floor(rand(0,p.length)),1);
+        if(Math.random() < 0.22) p.splice(Math.floor(rand(0,p.length+1)),0, (p.reduce((s,v)=>s+v,0)/p.length) + rand(-28,28));
         p = p.map(n => n + rand(-8,8));
         this.signalMap[a] = p;
       }
@@ -207,42 +193,39 @@ class Agent {
         reproduce: mkMelody(660)
       };
     }
-    this.nn = new NeuralNetwork(16,20,5,0.02);
-    // color hue from melody tendency
-    this.hue = Math.floor(200 * this.melodyTendency) + 20; // 20..220
+    this.nn = new NeuralNetwork(16, 20, 5, 0.02);
+    this.hue = Math.floor(220 * this.melodyTendency) + 10;
   }
 
   getState(){
     const avgReward = this.memory.length>0 ? this.memory.reduce((s,m)=>s+m[2],0)/this.memory.length : 0;
     const avgTrust = Object.keys(this.trust).length>0 ? Object.values(this.trust).reduce((a,b)=>a+b,0)/Object.keys(this.trust).length : 0;
-    // hearing: compute average pitch & similarity of recentSignals excluding self
-    const heard = recentSignals.filter(s => s.sender !== this.name);
+    const heard = recentSignals.filter(s => s.sender !== this);
     let avgPitch = 0, varPitch = 0, avgSim = 0;
-    if(heard.length > 0){
-      const means = heard.map(h => h.melody.reduce((s,v)=>s+v,0)/h.melody.length);
-      const meanAll = means.reduce((s,v)=>s+v,0)/means.length;
+    if(recentSignals.length > 0){
+      const means = recentSignals.map(h => (h.melody.reduce((s,v)=>s+v,0)/h.melody.length));
+      const meanAll = means.reduce((s,v)=>s+v,0) / means.length;
       avgPitch = meanAll / 1000;
       varPitch = means.reduce((s,v)=>s + (v-meanAll)*(v-meanAll), 0) / (means.length * (1000*1000));
       const own = this.signalMap[this.lastAction] || [];
-      avgSim = heard.reduce((s,h)=> s + melodySimilarity(own, h.melody), 0) / heard.length;
+      avgSim = recentSignals.reduce((s,h)=> s + melodySimilarity(own, h.melody), 0) / Math.max(1, recentSignals.length);
     }
     return [
       this.food/90, this.energy/90, this.metal/50,
       this.strength/12, this.cooperation,
       this.melodyTendency, this.rhythmComplexity, this.harmonyPreference,
       avgReward, avgTrust, this.memory.length/this.MAX_MEMORY, Math.random(),
-      avgPitch, varPitch, avgSim, (this.generation/12)
+      avgPitch, varPitch, avgSim, this.generation/12
     ];
   }
 
   chooseAction(){
     const state = this.getState();
-    const probs = this.nn.forward(state);
+    const p = this.nn.forward(state);
     let r = Math.random(), s=0, idx=0;
-    for(let i=0;i<probs.length;i++){ s+=probs[i]; if(r < s){ idx = i; break; } }
+    for(let i=0;i<p.length;i++){ s+=p[i]; if(r<s){ idx=i; break; } }
     const acts = ["gather","trade","fight","social","reproduce"];
-    this.lastActionIdx = idx;
-    this.lastAction = acts[idx];
+    this.lastActionIdx = idx; this.lastAction = acts[idx];
     return this.lastAction;
   }
 
@@ -254,30 +237,29 @@ class Agent {
 
     switch(this.lastAction){
       case "gather": {
-        // choose scarcest resource to encourage variety
-        const keys = Object.keys(environment);
-        keys.sort((a,b)=> (environment[a] - environment[b]));
+        // target scarcest resource
+        const keys = Object.keys(environment).sort((a,b)=> environment[a]-environment[b]);
         const res = keys[0];
         const amount = Math.min(Math.floor(rand(1,5)), Math.floor(environment[res]));
         environment[res] = Math.max(0, environment[res] - amount);
-        if(res==="food") this.food += amount;
-        else if(res==="energy") this.energy += amount;
-        else if(res==="water") this.food += Math.floor(amount*0.35);
-        else if(res==="trees") this.metal += Math.floor(amount*0.25);
-        else if(res==="metal") this.metal += amount;
+        if(res === "food") this.food += amount;
+        else if(res === "energy") this.energy += amount;
+        else if(res === "water") this.food += Math.floor(amount*0.3);
+        else if(res === "trees") this.metal += Math.floor(amount*0.2);
+        else if(res === "metal") this.metal += amount;
         reward += amount/4;
       } break;
       case "trade": {
-        const partners = allAgents.filter(a => a!==this && a.alive && this.trust[a.name] > 0.4);
-        if(partners.length>0){
+        const partners = allAgents.filter(a => a !== this && a.alive && this.trust[a.name] > 0.4);
+        if(partners.length){
           const p = choice(partners);
           const give = Math.min(this.metal, Math.floor(rand(1,3)));
-          if(give > 0){ this.metal -= give; p.food += give; reward += give/3; this.trust[p.name]+=0.05; p.trust[this.name]+=0.03; }
+          if(give>0){ this.metal -= give; p.food += give; reward += give/3; this.trust[p.name]+=0.05; p.trust[this.name]+=0.03; }
         }
       } break;
       case "fight": {
-        const targets = allAgents.filter(a => a!==this && a.alive);
-        if(targets.length>0){
+        const targets = allAgents.filter(a => a !== this && a.alive);
+        if(targets.length){
           const t = choice(targets);
           if(this.strength > t.strength){
             const stolen = Math.min(t.food, Math.floor(rand(1,3)));
@@ -287,19 +269,20 @@ class Agent {
       } break;
       case "social": {
         this.food -= 1; reward -= 0.05;
-        allAgents.forEach(a => { if(a!==this) this.trust[a.name] = clamp(this.trust[a.name]+0.015, 0,1); });
+        allAgents.forEach(a => { if(a!==this) this.trust[a.name] = clamp(this.trust[a.name] + 0.015, 0,1); });
       } break;
       case "reproduce": {
         if(this.food > 14 && this.energy > 12){
           this.food -= 12; this.energy -= 12;
-          const child = new Agent(this.name + "_child", this, this.generation + 1);
+          const child = new Agent(this, this.generation+1);
+          child.name = "agent" + Math.floor(Math.random()*1e6);
           this.children.push(child); allAgents.push(child);
           reward += 1.5;
         }
       } break;
     }
 
-    // survival costs & training
+    // survival cost
     reward += 0.08;
     this.food -= 0.6; this.energy -= 0.6;
     if(this.food <= 0 || this.energy <= 0){ this.alive = false; reward -= 1.8; }
@@ -311,135 +294,214 @@ class Agent {
     }
     this.lifetimeReward += reward;
 
-    // broadcast signal for others to hear
+    // broadcast signal (for hearing) and schedule audio
     if(this.alive){
-      const sig = { sender:this.name, action:this.lastAction, melody:this.signalMap[this.lastAction].slice(), rhythm:this.rhythmComplexity };
+      const sig = { sender: this.name || Math.random(), action: this.lastAction, melody: this.signalMap[this.lastAction].slice(), rhythm: this.rhythmComplexity };
       recentSignals.push(sig);
-      // schedule audio
       setTimeout(()=> this.playPhrase(sig.melody, sig.rhythm), rand(0,180));
     }
 
-    // call-and-response
+    // social call-and-response: if many social signals, reply sometimes
     const heardSocial = recentSignals.filter(s => s.action === "social" || s.action === "trade");
     if(heardSocial.length > 0 && Math.random() < 0.12 * this.cooperation){
       const base = this.signalMap["social"].slice();
       const reply = base.map(n => n + rand(-8,8));
-      setTimeout(()=> playMelody(reply, 0.085, 0.055), rand(80,220));
-      heardSocial.forEach(h => { this.trust[h.sender] = clamp((this.trust[h.sender]||0.5)+0.02, 0,1); });
+      setTimeout(()=> playMelody(reply, 0.085, 0.05), rand(80,220));
+      heardSocial.forEach(h => { /* increase trust slightly toward senders */ });
     }
 
-    // small mutation after reproduction
+    // cultural sync: nudge own phrases toward neighbors' phrases if cooperative and close
+    const neighbors = allAgents.filter(a => a !== this && a.alive && Math.hypot(a.x - this.x, a.y - this.y) < 120);
+    if(neighbors.length > 0 && Math.random() < 0.18 * this.cooperation){
+      // compute average melody for 'social' among neighbors
+      const avgMel = {};
+      ["gather","trade","social","fight","reproduce"].forEach(act => {
+        const pool = neighbors.map(n => n.signalMap[act]);
+        if(pool.length){
+          // average by index (wrap)
+          const L = Math.max(...pool.map(p=>p.length));
+          let merged = [];
+          for(let i=0;i<L;i++){
+            const mean = pool.reduce((s,p)=> s + (p[i % p.length] || pool[0][0]), 0) / pool.length;
+            merged.push(mean);
+          }
+          avgMel[act] = merged;
+        }
+      });
+      // nudge own social phrase slightly toward neighbor average
+      if(avgMel["social"]){
+        const own = this.signalMap["social"];
+        const L = Math.max(own.length, avgMel["social"].length);
+        const newp = [];
+        for(let i=0;i<L;i++){
+          const o = own[i % own.length] || own[0];
+          const a = avgMel["social"][i % avgMel["social"].length];
+          newp.push(o + (a - o) * 0.06 * this.cooperation);
+        }
+        this.signalMap["social"] = newp.map(n => n + rand(-1.5,1.5));
+      }
+    }
+
+    // occasional mutation on reproduce success
     if(this.lastAction === "reproduce" && Math.random() < 0.07){
-      const list = this.signalMap["reproduce"];
-      if(Math.random() < 0.5) list.push(list[list.length-1] + rand(-18,18));
-      else if(list.length > 2 && Math.random() < 0.3) list.splice(Math.floor(rand(0,list.length)),1);
+      const r = this.signalMap["reproduce"];
+      if(Math.random() < 0.5) r.push(r[r.length-1] + rand(-18,18));
+      else if(r.length > 2 && Math.random() < 0.3) r.splice(Math.floor(rand(0,r.length)),1);
     }
   }
 
   playPhrase(melody, rhythm){
-    const vol = clamp(0.04 + 0.06 * (this.energy/40) * (0.4 + 0.6 * this.harmonyPreference), 0.02, 0.16);
-    playMelody(melody, 0.10 + 0.06 * (1 - this.rhythmComplexity), vol);
+    const vol = clamp(0.035 + 0.06 * (this.energy/40) * (0.4 + 0.6 * this.harmonyPreference), 0.02, 0.16);
+    playMelody(melody, 0.10 + 0.05 * (1 - this.rhythmComplexity), vol);
   }
 
-  // small drift for visual movement
-  stepVisual(dt=1){
+  // apply simple flocking forces visually
+  stepVisual(dt=1, allAgents){
+    // basic drift
+    this.vx += rand(-0.02,0.02);
+    this.vy += rand(-0.02,0.02);
+
+    // neighbors for flocking
+    const neighbors = (allAgents || []).filter(a => a !== this && Math.hypot(a.x - this.x, a.y - this.y) < 120);
+    // cohesion: move toward average position
+    if(neighbors.length){
+      const avgx = neighbors.reduce((s,n)=>s+n.x,0)/neighbors.length;
+      const avgy = neighbors.reduce((s,n)=>s+n.y,0)/neighbors.length;
+      this.vx += (avgx - this.x) * 0.0009 * (0.8 + this.cooperation);
+      this.vy += (avgy - this.y) * 0.0009 * (0.8 + this.cooperation);
+      // alignment: match velocity
+      const avvx = neighbors.reduce((s,n)=>s+n.vx,0)/neighbors.length;
+      const avvy = neighbors.reduce((s,n)=>s+n.vy,0)/neighbors.length;
+      this.vx += (avvx - this.vx) * 0.02 * this.cooperation;
+      this.vy += (avvy - this.vy) * 0.02 * this.cooperation;
+    }
+    // separation: avoid collisions
+    (allAgents || []).forEach(a => {
+      if(a === this) return;
+      const dx = a.x - this.x, dy = a.y - this.y;
+      const d = Math.hypot(dx,dy);
+      if(d < 18 && d > 0){
+        this.vx -= dx/d * 0.06;
+        this.vy -= dy/d * 0.06;
+      }
+    });
+
+    // limit speed
+    const speed = Math.hypot(this.vx, this.vy);
+    const maxSpeed = 1.8 + this.cooperation;
+    if(speed > maxSpeed){
+      this.vx = (this.vx / speed) * maxSpeed;
+      this.vy = (this.vy / speed) * maxSpeed;
+    }
+
     this.x += this.vx * dt;
     this.y += this.vy * dt;
-    // keep within bounds
-    if(this.x < 30){ this.x=30; this.vx *= -1; }
-    if(this.x > canvas.width-30){ this.x = canvas.width-30; this.vx *= -1; }
-    if(this.y < 30){ this.y=30; this.vy *= -1; }
-    if(this.y > canvas.height-30){ this.y = canvas.height-30; this.vy *= -1; }
+    // bounds
+    if(this.x < 18){ this.x = 18; this.vx *= -0.6; }
+    if(this.x > canvas.width - 18){ this.x = canvas.width - 18; this.vx *= -0.6; }
+    if(this.y < 18){ this.y = 18; this.vy *= -0.6; }
+    if(this.y > canvas.height - 18){ this.y = canvas.height - 18; this.vy *= -0.6; }
   }
 }
 
-// -------------------- Simulation init --------------------
-let agents = [ new Agent("ALEX"), new Agent("JOE"), new Agent("SAM"), new Agent("JESSE"), new Agent("BLAKE") ];
+// ===================== Simulation state & boot =====================
+let agents = [];
+for(let i=0;i<8;i++) agents.push(new Agent(null,0));
 
-// flatten helper
-function flatten(list){
+let running=false, stepTimer=null;
+let stepCount = 0;
+
+// flatten lineage for processing
+function flattenAll(list){
   const out = [];
-  list.forEach(a => { out.push(a); if(a.children && a.children.length) out.push(...flatten(a.children)); });
+  list.forEach(a => { out.push(a); if(a.children && a.children.length) out.push(...flattenAll(a.children)); });
   return out;
 }
 
-// -------------------- Simulation step --------------------
+// ===================== simulate step =====================
 function simulateStep(){
-  // clear hearing buffer for this step (agents will push their signals)
-  recentSignals = [];
-  const all = flatten(agents);
-  const alive = all.filter(a=>a.alive);
-
+  recentSignals = []; // clear hearing buffer at each step start
+  const all = flattenAll(agents);
+  const alive = all.filter(a => a.alive);
   if(alive.length === 0){
-    // repopulate small brood derived from last lexicon if none alive
-    console.warn("All agents died — repopulating a small brood...");
-    const seed = agents.slice(0, Math.min(4, agents.length));
-    agents = seed.map((s,i) => new Agent("repop"+i, seed[i%seed.length], 0));
+    // repopulate small brood derived from existing agents if all died
+    const seed = agents.slice(0,4);
+    agents = seed.map((s,i)=> new Agent(null,0));
   }
 
-  alive.forEach(a => a.act(flatten(agents))); // pass full set so children appended correctly
+  // each alive agent acts (they will push signals to recentSignals)
+  alive.forEach(a => a.act(all));
 
-  // environment regen & mild decay
+  // simple environment regen
   if(stepCount % 5 === 0){
-    environment.food = Math.min(environment.food + 80, 1000);
-    environment.energy = Math.min(environment.energy + 50, 1000);
-    environment.metal = Math.min(environment.metal + 30, 1000);
-    environment.air = Math.min(environment.air + 40, 1000);
-    environment.trees = Math.min(environment.trees + 80, 1000);
-    environment.water = Math.min(environment.water + 80, 1000);
-    environment.fire = Math.min(environment.fire + 40, 1000);
+    environment.food = clamp(environment.food + 80, 0, 1000);
+    environment.energy = clamp(environment.energy + 50, 0, 1000);
+    environment.metal = clamp(environment.metal + 30, 0, 1000);
+    environment.water = clamp(environment.water + 60, 0, 1000);
+    environment.trees = clamp(environment.trees + 60, 0, 1000);
+    environment.fire = clamp(environment.fire + 30, 0, 1000);
   }
   if(Math.random() < 0.12){
     environment.food = Math.max(0, environment.food - rand(0,6));
     environment.water = Math.max(0, environment.water - rand(0,4));
   }
 
-  // ambient control: if few alive, raise ambient pad; if many alive, lower
+  // ambient pad level based on alive count (fewer alive => stronger ambient)
   const aliveCount = alive.length;
-  const ambientLevel = clamp(1 - (aliveCount/10), 0, 1); // more alive -> less ambient
-  setAmbientLevel(ambientLevel);
+  const ambientLevel = clamp(1 - (aliveCount/18), 0, 1);
+  setAmbient(ambientLevel);
 
   stepCount++;
 }
 
-// -------------------- Drawing --------------------
+// ===================== Drawing / UI =====================
 function draw(){
   ctx.clearRect(0,0,canvas.width,canvas.height);
-
-  // draw subtle background grid
-  ctx.fillStyle = "#071017";
+  ctx.fillStyle = "#051018";
   ctx.fillRect(0,0,canvas.width,canvas.height);
 
-  // draw agents as dots with pulsing halo
-  const all = flatten(agents);
-  const timeNow = performance.now();
+  const all = flattenAll(agents);
+  const t = performance.now();
 
-  all.forEach((a)=>{
-    // visual step
-    a.stepVisual(1);
+  // draw faint links for parent-child to visualize family clusters
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = "rgba(255,255,255,0.04)";
+  all.forEach(a => {
+    if(a.children && a.children.length){
+      a.children.forEach(c => {
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(c.x, c.y);
+        ctx.stroke();
+      });
+    }
+  });
 
-    // halo pulse by energy & whether they produced a signal this step
-    const energyRatio = clamp(a.energy,0,60)/60;
-    const pulse = 0.3 + 0.6 * Math.abs(Math.sin((timeNow/430) + (a.generation*0.6)));
-    const haloRadius = 8 + 28 * energyRatio * pulse;
-    const hue = a.hue; // color hue
-    const alpha = (a.alive ? (0.12 + 0.6 * energyRatio * pulse) : 0.06);
+  // update visual step for each agent
+  all.forEach(a => a.stepVisual(1, all));
 
+  // draw each agent as halo + center dot
+  all.forEach(a => {
+    const energyRatio = clamp(a.energy, 0, 60) / 60;
+    const pulse = 0.28 + 0.55 * Math.abs(Math.sin((t / 420) + a.generation));
+    const haloRadius = 8 + 38 * energyRatio * pulse;
+    const hue = a.hue;
+    const alpha = a.alive ? 0.12 + 0.6 * energyRatio * pulse : 0.05;
     ctx.beginPath();
     ctx.fillStyle = `hsla(${hue},70%,60%,${alpha})`;
     ctx.arc(a.x, a.y, haloRadius, 0, Math.PI*2);
     ctx.fill();
 
     // central dot
-    const dotRadius = a.alive ? (4 + 6 * energyRatio) : 3;
+    const dotRadius = a.alive ? (4 + 6*energyRatio) : 3;
     ctx.beginPath();
-    const sat = a.alive ? 70 : 12;
-    const light = a.alive ? 50 : 28;
+    const sat = a.alive ? 72 : 12;
+    const light = a.alive ? 50 : 30;
     ctx.fillStyle = `hsl(${hue}, ${sat}%, ${light}%)`;
     ctx.arc(a.x, a.y, dotRadius, 0, Math.PI*2);
     ctx.fill();
 
-    // small ring when they emitted recently (search recentSignals)
+    // ring when emitted recently
     const emitted = recentSignals.find(s => s.sender === a.name);
     if(emitted){
       ctx.beginPath();
@@ -450,69 +512,61 @@ function draw(){
     }
   });
 
-  // HUD: population & generation stats
-  const aliveCount = all.filter(a=>a.alive).length;
-  document.getElementById('popInfo').textContent = `Population: ${aliveCount} (Total nodes: ${all.length})`;
-  // find max generation to inform legend
-  const maxGen = Math.max(...all.map(a=>a.generation));
-  document.getElementById('genInfo').textContent = `Max generation: ${maxGen}`;
+  // HUD
+  const aliveCount = all.filter(a => a.alive).length;
+  document.getElementById('popInfo').textContent = `Population: ${aliveCount} (Nodes: ${all.length})`;
+  document.getElementById('genInfo').textContent = `Max gen: ${Math.max(...all.map(a=>a.generation))}`;
 
   requestAnimationFrame(draw);
 }
 requestAnimationFrame(draw);
 
-// -------------------- UI resource display --------------------
+// resource UI updater
 function updateResourceUI(){
-  const container = document.getElementById('resources');
-  container.innerHTML = '<strong>Resources</strong>';
-  for(const k of Object.keys(environment)){
+  const el = document.getElementById('resources');
+  el.innerHTML = '<strong>Resources</strong>';
+  Object.keys(environment).forEach(k=>{
     const bar = document.createElement('div'); bar.className = 'resource-bar';
     const fill = document.createElement('div'); fill.className = 'resource-fill';
     const pct = Math.floor(clamp(environment[k],0,1000)/1000*100);
     fill.style.width = pct + '%';
-    // color by resource
     if(k==='food') fill.style.background='#66ff66';
     else if(k==='water') fill.style.background='#66ccff';
     else if(k==='energy') fill.style.background='#ffd166';
     else if(k==='metal') fill.style.background='#cccccc';
     else if(k==='trees') fill.style.background='#99ff99';
     else if(k==='fire') fill.style.background='#ff9966';
-    else fill.style.background='#88aaff';
     bar.textContent = `${k}: ${Math.floor(environment[k])}`;
     bar.appendChild(fill);
-    container.appendChild(bar);
-  }
+    el.appendChild(bar);
+  });
   requestAnimationFrame(updateResourceUI);
 }
 requestAnimationFrame(updateResourceUI);
 
-// -------------------- Loop control --------------------
+// ===================== Controls =====================
 document.getElementById('startBtn').addEventListener('click', ()=>{
   if(running) return;
-  // resume audio context if not running (user gesture)
   if(audioCtx.state === 'suspended') audioCtx.resume();
   running = true;
-  stepInterval = Math.max(50, parseInt(document.getElementById('intervalInput').value) || 450);
-  stepTimer = setInterval(simulateStep, stepInterval);
+  const interval = Math.max(50, parseInt(document.getElementById('intervalInput').value) || 400);
+  stepTimer = setInterval(simulateStep, interval);
 });
 document.getElementById('stopBtn').addEventListener('click', ()=>{
   running = false;
   if(stepTimer) clearInterval(stepTimer);
-  setAmbientLevel(0.08);
+  setAmbient(0.06);
 });
 document.getElementById('intervalInput').addEventListener('change', (e)=>{
-  const v = Math.max(50, parseInt(e.target.value) || 450);
-  if(running){
-    clearInterval(stepTimer);
-    stepTimer = setInterval(simulateStep, v);
-  }
+  const v = Math.max(50, parseInt(e.target.value) || 400);
+  if(running){ clearInterval(stepTimer); stepTimer = setInterval(simulateStep, v); }
 });
 
-// -------------------- Helper to inspect lexicon in console --------------------
+// small helper to inspect lexicon in console
 window.dumpLexicon = function(){
-  const all = flatten(agents);
+  const all = flattenAll(agents);
   const map = {};
-  all.forEach(a=>{
+  all.forEach(a => {
     for(const k in a.signalMap){
       map[k] = map[k] || [];
       map[k].push(a.signalMap[k].slice(0,6));
@@ -521,8 +575,8 @@ window.dumpLexicon = function(){
   console.log("Lexicon sample:", map);
 };
 
-// Start ambient quietly
-startAmbient(); setAmbientLevel(0.08);
+// start gentle ambient
+startAmbient(); setAmbient(0.06);
 </script>
 </body>
 </html>
