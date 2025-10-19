@@ -983,6 +983,40 @@ console.log("New Temperature:", environment.chemicalInventory.Temperature);
 console.log("Resulting Reward:", reward);
 // You can call nnToJSON(planet.policy) in console to get a JSON string for a trained policy.
 // Or load it later with nnFromJSON(jsonStr) and assign to planet.policy.
+// baseline natural death
+
+function simulateTick(intel, dt) {
+    if(intel.dead) return; // skip extinct planets
+
+    // 1️⃣ Natural death
+    intel.population -= intel.population * 0.001 * dt;
+
+    // 2️⃣ Starvation/resource shortage
+    let foodFactor = intel.resources.food / intel.population || 0;
+    let energyFactor = intel.resources.energy / intel.population || 0;
+    let shortageFactor = Math.min(foodFactor, energyFactor, 1); // max 1
+    intel.population *= shortageFactor;
+
+    // 3️⃣ Combat / external attacks (example: attackerShips passed in intel object)
+    if(intel.incomingAttack) {
+        let damage = intel.incomingAttack * 0.1 * dt;
+        intel.population -= damage;
+    }
+
+    // 4️⃣ Random catastrophes
+    if(Math.random() < 0.0001) { // very rare
+        intel.population *= 0.5;
+        console.log(`${intel.name} hit by disaster! Population halved.`);
+    }
+
+    // 5️⃣ Prevent negative population & handle extinction
+    if(intel.population <= 0) {
+        intel.dead = true;
+        intel.population = 0;
+        intel.resources = {food: 0, energy: 0, metal: 0};
+        console.log(`${intel.name} has gone extinct.`);
+    }
+}
 
 </script>
 </body>
