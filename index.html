@@ -20,6 +20,22 @@
 <div id="info"></div>
 <div id="controls"><button id="backButton" style="display:none">← Zoom Out</button></div>
 <canvas id="universe"></canvas>
+<!-- Simulation Log -->
+<div id="eventLog" style="
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 150px;
+  background: rgba(0, 0, 0, 0.8);
+  color: #0f0;
+  font-family: monospace;
+  font-size: 14px;
+  overflow-y: auto;
+  padding: 10px;
+  box-sizing: border-box;
+"></div>
+
 <script>
 // =====================
 // Interactive Galaxy + Reinforcement Learning
@@ -1086,6 +1102,334 @@ const interval = setInterval(() => {
     simulateTick();
 }, 500);
 
+let agents = [];
+let numAgents = 20;
+
+function setup() {
+  createCanvas(800, 600);
+  background(30); // dark background so colors show
+  for (let i = 0; i < numAgents; i++) {
+    agents.push(createAgent());
+  }
+}
+
+function draw() {
+  // No background clearing here! Trails will persist.
+
+  let newAgents = [];
+
+  for (let agent of agents) {
+    // Update resources (simplified)
+    agent.food += random(-1, 2);
+    agent.energy += random(-1, 1);
+
+    // Map genes/resources to art properties
+    let r = map(agent.food, 0, 100, agent.genes.colorR[0], agent.genes.colorR[1]);
+    let g = map(agent.energy, 0, 100, agent.genes.colorG[0], agent.genes.colorG[1]);
+    let b = map(agent.metal, 0, 50, agent.genes.colorB[0], agent.genes.colorB[1]);
+    let sz = map(agent.food, 0, 100, agent.genes.size[0], agent.genes.size[1]);
+
+    stroke(r, g, b, 150);
+    strokeWeight(sz);
+    point(agent.x, agent.y);
+
+    // Move agent
+    agent.x += cos(agent.direction) * agent.genes.speed * (agent.energy / 20);
+    agent.y += sin(agent.direction) * agent.genes.speed * (agent.energy / 20);
+    agent.direction += random(-agent.genes.turning, agent.genes.turning);
+
+    // Wrap around canvas
+    agent.x = (agent.x + width) % width;
+    agent.y = (agent.y + height) % height;
+
+    // Reproduce if resources high
+    if (agent.food > 80 && agent.energy > 50) {
+      newAgents.push(mutateAgent(agent));
+      agent.food /= 2;
+      agent.energy /= 2;
+    }
+
+    // Natural death
+    if (agent.food > 0 && agent.energy > 0) {
+      newAgents.push(agent);
+    }
+  }
+
+  agents = newAgents;
+}
+
+// ----- Agent Factory -----
+function createAgent() {
+  return {
+    x: random(width),
+    y: random(height),
+    food: random(50, 100),
+    energy: random(30, 80),
+    metal: random(20, 50),
+    direction: random(TWO_PI),
+    genes: {
+      colorR: [50, 255],
+      colorG: [50, 255],
+      colorB: [50, 255],
+      size: [2, 10],
+      speed: random(0.5, 2),
+      turning: random(0.05, 0.3)
+    }
+  };
+}
+
+// ----- Mutation Function -----
+function mutateAgent(parent) {
+  let child = JSON.parse(JSON.stringify(parent));
+  child.genes.speed += random(-0.2, 0.2);
+  child.genes.turning += random(-0.05, 0.05);
+  child.genes.size = child.genes.size.map(v => v + random(-1, 1));
+  child.genes.colorR = child.genes.colorR.map(v => constrain(v + random(-10, 10), 0, 255));
+  child.genes.colorG = child.genes.colorG.map(v => constrain(v + random(-10, 10), 0, 255));
+  child.genes.colorB = child.genes.colorB.map(v => constrain(v + random(-10, 10), 0, 255));
+  child.x += random(-5, 5);
+  child.y += random(-5, 5);
+  child.direction += random(-0.5, 0.5);
+  child.food = parent.food / 2;
+  child.energy = parent.energy / 2;
+  child.metal = parent.metal / 2;
+  return child;
+}
+
+// Example Agent structure for art
+class ArtAgent {
+    constructor(x, y) {
+        this.x = x;
+        this.y = y;
+        this.color = `hsl(${Math.random()*360}, 70%, 50%)`;
+        this.size = Math.random() * 20 + 5;
+        this.policyNetwork = new MLP([4, 8, 4]); // simple NN for art decisions
+    }
+
+    step(canvasCtx) {
+        // Input: normalized x, y, time, random noise
+        const input = [this.x/width, this.y/height, performance.now()/1000 % 1, Math.random()];
+        const output = this.policyNetwork.forward(input); // output = [dx, dy, dColor, dSize]
+
+        // Update visual parameters
+        this.x += (output[0] - 0.5) * 10;
+        this.y += (output[1] - 0.5) * 10;
+        this.size = Math.max(2, this.size + (output[3] - 0.5) * 5);
+
+        // Change color hue
+        let h = (parseInt(this.color.slice(4)) + (output[2]-0.5)*30) % 360;
+        this.color = `hsl(${h}, 70%, 50%)`;
+
+        // Draw on canvas
+        canvasCtx.fillStyle = this.color;
+        canvasCtx.beginPath();
+        canvasCtx.arc(this.x, this.y, this.size, 0, Math.PI*2);
+        canvasCtx.fill();
+    }
+}
+
+// Simple music agent
+class MusicAgent {
+    constructor() {
+        this.policyNetwork = new MLP([4, 16, 3]); // outputs freq, duration, volume
+        this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+
+    step() {
+        const t = performance.now()/1000;
+        const input = [Math.sin(t), Math.random(), Math.random(), Math.random()];
+        const output = this.policyNetwork.forward(input);
+
+        const freq = 220 + output[0] * 440; // Hz
+        const duration = 0.1 + output[1] * 0.4; // seconds
+        const volume = Math.min(1, Math.max(0, output[2]));
+
+        const osc = this.audioCtx.createOscillator();
+        const gainNode = this.audioCtx.createGain();
+        gainNode.gain.value = volume;
+
+        osc.connect(gainNode);
+        gainNode.connect(this.audioCtx.destination);
+
+        osc.frequency.value = freq;
+        osc.type = 'sine';
+        osc.start();
+        osc.stop(this.audioCtx.currentTime + duration);
+    }
+}
+
+function logEvent(message) {
+  const log = document.getElementById("eventLog");
+  const entry = document.createElement("div");
+  entry.textContent = message;
+  log.appendChild(entry);
+  log.scrollTop = log.scrollHeight;
+}
+
+function randomEventEngine(planets) {
+  // 10% chance each tick
+  if (Math.random() < 0.1) {
+    const eventTypes = [
+      "meteor_strike",
+      "resource_boom",
+      "plague",
+      "alliance_shift",
+      "rebellion",
+      "tech_breakthrough"
+    ];
+
+    const eventType = eventTypes[Math.floor(Math.random() * eventTypes.length)];
+    const target = planets[Math.floor(Math.random() * planets.length)];
+
+    switch (eventType) {
+      case "meteor_strike":
+        target.population = Math.max(0, target.population * 0.9);
+        logEvent(`💥 Meteor strike hits ${target.name}! Population reduced.`);
+        break;
+
+      case "resource_boom":
+        const resourceGain = Math.floor(Math.random() * 50000) + 10000;
+        target.population += resourceGain / 10;
+        logEvent(`💎 ${target.name} discovers rare minerals! Population +${Math.floor(resourceGain / 10)}.`);
+        break;
+
+      case "plague":
+        target.population = Math.max(0, target.population * 0.8);
+        logEvent(`☣️ Plague devastates ${target.name}.`);
+        break;
+
+      case "alliance_shift":
+        const other = planets[Math.floor(Math.random() * planets.length)];
+        if (other !== target) {
+          target.relations = "Trading";
+          logEvent(`🤝 ${target.name} signs a trade pact with ${other.name}.`);
+        }
+        break;
+
+      case "rebellion":
+        target.population = Math.max(0, target.population * 0.7);
+        logEvent(`🔥 Rebellion erupts on ${target.name}!`);
+        break;
+
+      case "tech_breakthrough":
+        target.state = "Advanced";
+        logEvent(`🚀 ${target.name} achieves a major technological breakthrough!`);
+        break;
+    }
+  }
+}
+
+// 🔄 Run random events periodically
+setInterval(() => {
+  randomEventEngine(planets);
+  drawPlanets(); // re-render if visuals change
+}, 2000);
+
+class PlanetAI {
+  constructor(name) {
+    this.name = name;
+    this.population = 100 + Math.random() * 400;
+    this.state = "primitive";
+    this.resources = { food: 100, energy: 100, metal: 50 };
+    this.relations = {}; // trade/war/neutral
+
+    // --- Meta-learning variables ---
+    this.resilience = 0.5; // 0–1: how fast it recovers from chaos
+    this.adaptability = 0.5; // 0–1: learning rate from events
+    this.memory = []; // stores recent events
+    this.learningRate = 0.05; // base rate of adaptation
+  }
+
+  experienceEvent(event) {
+    this.memory.push(event.type);
+    if (this.memory.length > 10) this.memory.shift();
+
+    // React based on type
+    if (event.type === "war") this.population *= 0.9;
+    if (event.type === "famine") this.resources.food *= 0.7;
+    if (event.type === "solar_flare") this.resources.energy *= 0.6;
+
+    // Learn from it
+    this.adapt(event.type);
+  }
+
+  adapt(eventType) {
+    // If it’s seen this event type before, increase resilience
+    const past = this.memory.filter(e => e === eventType).length;
+    const learningBoost = past * this.learningRate;
+    this.resilience = Math.min(1, this.resilience + learningBoost * 0.5);
+    this.adaptability = Math.min(1, this.adaptability + learningBoost * 0.3);
+
+    // Recover faster based on resilience
+    this.recover();
+  }
+
+  recover() {
+    const recoverySpeed = 0.05 + this.resilience * 0.1;
+    for (let key in this.resources) {
+      this.resources[key] += recoverySpeed * this.resources[key];
+    }
+    this.population += this.population * recoverySpeed * 0.1;
+  }
+}
+
+
+function triggerRandomEvent(planets) {
+  const events = [
+    { type: "war", chance: 0.1 },
+    { type: "famine", chance: 0.1 },
+    { type: "solar_flare", chance: 0.05 },
+    { type: "trade_boom", chance: 0.1 },
+    { type: "plague", chance: 0.05 }
+  ];
+
+  planets.forEach(planet => {
+    events.forEach(event => {
+      if (Math.random() < event.chance) {
+        console.log(`⚠️ ${planet.name} experiences a ${event.type}`);
+        planet.experienceEvent(event);
+      }
+    });
+  });
+}
+
+function simulateStep(planets) {
+  triggerRandomEvent(planets);
+
+  planets.forEach(planet => {
+    planet.recover();
+
+    // Evolve civilization level
+    if (planet.resources.metal > 500 && planet.state === "primitive") {
+      planet.state = "industrial";
+    } else if (planet.resources.metal > 1500 && planet.state === "industrial") {
+      planet.state = "advanced";
+    }
+
+    // Print meta-learning stats
+    console.log(
+      `${planet.name}: resilience=${planet.resilience.toFixed(2)}, adaptability=${planet.adaptability.toFixed(2)}`
+    );
+  });
+}
+
+
 </script>
+<!-- Simulation Log -->
+<div id="eventLog" style="
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 150px;
+  background: rgba(0, 0, 0, 0.8);
+  color: #0f0;
+  font-family: monospace;
+  font-size: 14px;
+  overflow-y: auto;
+  padding: 10px;
+  box-sizing: border-box;
+"></div>
+
 </body>
 </html>
