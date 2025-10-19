@@ -1413,6 +1413,31 @@ function simulateStep(planets) {
   });
 }
 
+    step(actionIndex) {
+    if (this.population <= 0) {
+        this.population = 0; // clamp to 0
+        console.log(`${this.name} has perished!`);
+        return; // skip all further updates
+    }
+
+    const action = this.actions[actionIndex];
+    this.lastChemicalAction = action;
+
+    let chemicalReward = 0;
+    if (action.type === 'TRIGGER_REACTION' || action.type === 'APPLY_HEAT') {
+        const result = chemicalEnvironment.step(action);
+        chemicalReward = result.reward || 0;
+    }
+
+    const baseReward = this.calculateBaseReward();
+    this.population += baseReward.populationDelta;
+    this.resources += baseReward.resourcesDelta;
+
+    const totalReward = baseReward.reward + chemicalReward;
+
+    this.rlAgent.learn(actionIndex, totalReward);
+}
+
 
 </script>
 <!-- Simulation Log -->
