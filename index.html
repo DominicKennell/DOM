@@ -1018,7 +1018,8 @@ function simulateTick(intel, dt) {
         console.log(`${intel.name} has gone extinct.`);
     }
 }
-
+food_growth *= min(energy/required_energy, metal/required_metal)
+    
 </script>
 </body>
 </html>
